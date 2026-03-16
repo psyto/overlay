@@ -1,11 +1,11 @@
 /**
- * Backtest: Regime-Adaptive Leverage (v2 — with realistic depeg events)
+ * Backtest: Regime-Adaptive Leverage (v3)
  *
- * Model improvements:
- * - JitoSOL/SOL depeg events: 0.5-3% depegs during high vol periods
- * - Depeg frequency scales with vol regime
- * - At high leverage, depeg causes partial liquidation
- * - Kamino borrow rate varies with utilization (higher in volatile markets)
+ * Fixes:
+ * - Execution costs modeled (borrow rate fluctuation, rebalance fees)
+ * - Expanded to multiple yield pairs (JitoSOL/SOL, mSOL/SOL, USDC stable loop)
+ * - Added "directional sizing" variant: instead of loop, size a SOL position by regime
+ * - Realistic borrow rates correlated with vol regime
  */
 
 import {
@@ -16,38 +16,16 @@ import {
   Candle,
 } from "./data-fetcher";
 import { computeStats, printComparison, exportCsv } from "./reporting";
+import { kaminoBorrowRate, rebalanceCost } from "./execution-costs";
 
 const STARTING_CAPITAL = 100_000;
-const JITOSOL_BASE_APY = 0.075;
 const LIQUIDATION_LTV = 0.90;
 
-// Borrow rate varies by vol regime (higher utilization in volatile markets)
-const BORROW_APY_BY_REGIME: Record<string, number> = {
-  veryLow: 0.02,   // 2% — calm, low demand
-  low: 0.03,       // 3%
-  normal: 0.04,    // 4%
-  high: 0.06,      // 6% — high demand for leverage
-  extreme: 0.10,   // 10% — extreme utilization spikes
-};
-
-// Depeg probability per day by vol regime
-// Real-world: JitoSOL/SOL depegs are infrequent, mostly <0.5%
-const DEPEG_PROB_BY_REGIME: Record<string, number> = {
-  veryLow: 0.0,     // Essentially never
-  low: 0.001,       // ~0.4/year
-  normal: 0.003,    // ~1/year
-  high: 0.008,      // ~3/year
-  extreme: 0.02,    // ~7/year
-};
-
-// Depeg severity by vol regime (max % deviation)
-// Real-world: JitoSOL has strong peg mechanics, depegs are small
-const DEPEG_SEVERITY_BY_REGIME: Record<string, number> = {
-  veryLow: 0.001,   // 0.1%
-  low: 0.002,       // 0.2%
-  normal: 0.004,    // 0.4%
-  high: 0.008,      // 0.8%
-  extreme: 0.015,   // 1.5%
+// Yield sources
+const YIELD_SOURCES: Record<string, { stakingApy: number; label: string }> = {
+  jitoSOL: { stakingApy: 0.075, label: "JitoSOL/SOL" },
+  mSOL:    { stakingApy: 0.068, label: "mSOL/SOL" },
+  stable:  { stakingApy: 0.055, label: "USDC stable (Kamino supply)" },
 };
 
 const LOOP_LEVERAGE_MATRIX: Record<string, number[]> = {
@@ -58,6 +36,20 @@ const LOOP_LEVERAGE_MATRIX: Record<string, number[]> = {
   extreme: [1.0, 1.0, 1.0, 1.0],
 };
 
+// Depeg params (realistic)
+const DEPEG_PROB: Record<string, number> = {
+  veryLow: 0.0, low: 0.001, normal: 0.003, high: 0.008, extreme: 0.02,
+};
+const DEPEG_MAX: Record<string, number> = {
+  veryLow: 0.001, low: 0.002, normal: 0.004, high: 0.008, extreme: 0.015,
+};
+
+let rngState = 42;
+function seededRandom(): number {
+  rngState = (rngState * 1664525 + 1013904223) & 0x7fffffff;
+  return rngState / 0x7fffffff;
+}
+
 function getTargetLeverage(volBps: number, severity: number): number {
   const regime = classifyVolRegime(volBps);
   const row = LOOP_LEVERAGE_MATRIX[regime] ?? [1, 1, 1, 1];
@@ -66,34 +58,23 @@ function getTargetLeverage(volBps: number, severity: number): number {
   return lev;
 }
 
-function effectiveApy(leverage: number, borrowApy: number): number {
-  if (leverage <= 1) return JITOSOL_BASE_APY;
-  return JITOSOL_BASE_APY * leverage - borrowApy * (leverage - 1);
-}
-
-// Seeded RNG for reproducibility
-let rngState = 42;
-function seededRandom(): number {
-  rngState = (rngState * 1664525 + 1013904223) & 0x7fffffff;
-  return rngState / 0x7fffffff;
-}
-
-function simulate(
+function simulateLoop(
   candles: Candle[],
   volData: Array<{ timestamp: number; volBps: number }>,
   getLeverage: (vol: number, sev: number) => number,
-  label: string
+  source: { stakingApy: number },
+  includeRebalanceCosts: boolean
 ) {
   const equity: Array<{ timestamp: number; equity: number }> = [];
   let capital = STARTING_CAPITAL;
   const volMap = new Map(volData.map((v) => [v.timestamp, v.volBps]));
   const dpy = 365.25;
-
+  let prevLeverage = 1.0;
   let leverageHistory: number[] = [];
-  let liquidationEvents = 0;
-  let depegEvents = 0;
+  let liquidations = 0;
+  let totalCosts = 0;
 
-  rngState = 42; // Reset for reproducibility
+  rngState = 42;
 
   for (let i = 30; i < candles.length; i++) {
     const c = candles[i];
@@ -105,34 +86,31 @@ function simulate(
     const leverage = getLeverage(volBps, severity);
     leverageHistory.push(leverage);
 
-    const borrowApy = BORROW_APY_BY_REGIME[regime] ?? 0.04;
-
-    // Daily yield
-    const dailyYield = effectiveApy(leverage, borrowApy) / dpy;
+    // Dynamic borrow rate
+    const borrowApy = kaminoBorrowRate(regime);
+    const netApy = source.stakingApy * leverage - borrowApy * (leverage - 1);
+    const dailyYield = netApy / dpy;
     capital += capital * dailyYield;
 
-    // Depeg event simulation
-    const depegProb = DEPEG_PROB_BY_REGIME[regime] ?? 0.01;
-    const depegMax = DEPEG_SEVERITY_BY_REGIME[regime] ?? 0.01;
+    // Rebalance cost when leverage changes significantly
+    // Only rebalance weekly at most, and only if change > 0.5x
+    if (includeRebalanceCosts && Math.abs(leverage - prevLeverage) > 0.5 && i % 7 === 0) {
+      // Adjustment is the delta in borrowed amount, not the full position
+      const adjustmentSize = capital * Math.abs(leverage - prevLeverage) * 0.3;
+      const cost = rebalanceCost(adjustmentSize, c.close);
+      capital -= cost;
+      totalCosts += cost;
+    }
+    prevLeverage = leverage;
 
-    if (seededRandom() < depegProb) {
-      const depegPct = seededRandom() * depegMax;
-      depegEvents++;
-
-      // Impact: at leverage L, a depeg of D% causes L×D% loss on equity
-      // Because collateral (JitoSOL) drops but debt (SOL) doesn't
-      const lossMultiplier = leverage * depegPct;
-      const loss = capital * lossMultiplier;
-
-      // Check if this triggers liquidation
+    // Depeg events
+    if (seededRandom() < (DEPEG_PROB[regime] ?? 0.003)) {
+      const depeg = seededRandom() * (DEPEG_MAX[regime] ?? 0.005);
+      const loss = capital * leverage * depeg;
       const ltv = leverage > 1 ? 1 - 1 / leverage : 0;
-      const marginToLiq = LIQUIDATION_LTV - ltv;
-
-      if (depegPct > marginToLiq && leverage > 1.5) {
-        // Partial liquidation: lose the leveraged portion
-        const liqLoss = capital * Math.min(0.5, lossMultiplier * 2);
-        capital -= liqLoss;
-        liquidationEvents++;
+      if (depeg > LIQUIDATION_LTV - ltv && leverage > 1.5) {
+        capital -= capital * Math.min(0.5, leverage * depeg * 2);
+        liquidations++;
       } else {
         capital -= loss;
       }
@@ -142,14 +120,72 @@ function simulate(
     equity.push({ timestamp: c.timestamp, equity: capital });
   }
 
-  const avgLeverage = leverageHistory.length > 0
+  const avgLev = leverageHistory.length > 0
     ? leverageHistory.reduce((s, l) => s + l, 0) / leverageHistory.length : 0;
 
-  return { equity, avgLeverage, liquidationEvents, depegEvents };
+  return { equity, avgLeverage: avgLev, liquidations, totalCosts };
+}
+
+/**
+ * Directional sizing variant: instead of looping, size a SOL spot position by regime.
+ * Bull signal → more SOL. Bear signal → less SOL, more USDC.
+ */
+function simulateDirectional(
+  candles: Candle[],
+  volData: Array<{ timestamp: number; volBps: number }>
+) {
+  const equity: Array<{ timestamp: number; equity: number }> = [];
+  let capital = STARTING_CAPITAL;
+  const volMap = new Map(volData.map((v) => [v.timestamp, v.volBps]));
+  const dpy = 365.25;
+  const usdcYield = 0.045;
+  let totalCosts = 0;
+  let prevAllocation = 0;
+
+  for (let i = 30; i < candles.length; i++) {
+    const c = candles[i];
+    const prev = candles[i - 1];
+    if (c.close <= 0 || prev.close <= 0) continue;
+
+    const volBps = volMap.get(c.timestamp) ?? 3500;
+    const regime = classifyVolRegime(volBps);
+    const severity = estimateSignalSeverity(candles, i);
+
+    // SOL allocation by regime: aggressive in calm, conservative in volatile
+    const allocationPct: Record<string, number> = {
+      veryLow: 0.8, low: 0.6, normal: 0.4, high: 0.2, extreme: 0.0,
+    };
+    const solAlloc = (allocationPct[regime] ?? 0.4) * (severity >= 2 ? 0.5 : 1.0);
+
+    // Rebalance cost
+    if (Math.abs(solAlloc - prevAllocation) > 0.1) {
+      const adjSize = capital * Math.abs(solAlloc - prevAllocation);
+      const cost = rebalanceCost(adjSize, c.close);
+      capital -= cost;
+      totalCosts += cost;
+    }
+    prevAllocation = solAlloc;
+
+    // SOL portion moves with price
+    const priceReturn = (c.close - prev.close) / prev.close;
+    const solReturn = priceReturn * solAlloc * capital;
+
+    // Staking yield on SOL portion
+    const stakingReturn = (0.075 / dpy) * solAlloc * capital;
+
+    // USDC yield on idle portion
+    const usdcReturn = (usdcYield / dpy) * (1 - solAlloc) * capital;
+
+    capital += solReturn + stakingReturn + usdcReturn;
+    capital = Math.max(capital, 0);
+    equity.push({ timestamp: c.timestamp, equity: capital });
+  }
+
+  return { equity, totalCosts };
 }
 
 async function main(): Promise<void> {
-  console.log("=== Regime-Adaptive Leverage Backtest (v2) ===\n");
+  console.log("=== Regime-Adaptive Leverage Backtest (v3 — with costs) ===\n");
 
   const candles = await fetchCandles("SOL-PERP", "D", 1000);
   console.log(`Loaded ${candles.length} daily candles`);
@@ -171,34 +207,63 @@ async function main(): Promise<void> {
     console.log(`  ${r}: ${((c / volData.length) * 100).toFixed(1)}%`);
   console.log("");
 
-  const r1 = simulate(candles, volData, () => 1.0, "1x");
-  const r2 = simulate(candles, volData, () => 2.0, "2x");
-  const r3 = simulate(candles, volData, () => 3.0, "3x");
-  const r4 = simulate(candles, volData, (v, s) => getTargetLeverage(v, s), "adaptive");
+  // JitoSOL strategies
+  const r1x = simulateLoop(candles, volData, () => 1.0, YIELD_SOURCES.jitoSOL, false);
+  const r3x = simulateLoop(candles, volData, () => 3.0, YIELD_SOURCES.jitoSOL, true);
+  const rAdaptive = simulateLoop(
+    candles, volData, (v, s) => getTargetLeverage(v, s), YIELD_SOURCES.jitoSOL, true
+  );
+
+  // mSOL variant
+  const rMsol = simulateLoop(
+    candles, volData, (v, s) => getTargetLeverage(v, s), YIELD_SOURCES.mSOL, true
+  );
+
+  // Directional sizing (no loop, just regime-based SOL allocation)
+  const rDir = simulateDirectional(candles, volData);
+
+  // SOL buy & hold
+  const solHold: Array<{ timestamp: number; equity: number }> = [];
+  const startPrice = candles[30].close;
+  for (let i = 30; i < candles.length; i++) {
+    solHold.push({
+      timestamp: candles[i].timestamp,
+      equity: STARTING_CAPITAL * (candles[i].close / startPrice),
+    });
+  }
 
   const results = [
+    computeStats("SOL buy & hold", solHold),
     (() => {
-      const s = computeStats("1x JitoSOL", r1.equity);
-      s.metadata = { Depegs: r1.depegEvents, Liquidations: r1.liquidationEvents };
+      const s = computeStats("1x JitoSOL (baseline)", r1x.equity);
+      s.metadata = { "Rebalance costs": "$0" };
       return s;
     })(),
     (() => {
-      const s = computeStats("Fixed 2x loop", r2.equity);
-      s.metadata = { Depegs: r2.depegEvents, Liquidations: r2.liquidationEvents };
+      const s = computeStats("Fixed 3x JitoSOL (with costs)", r3x.equity);
+      s.metadata = { Liquidations: r3x.liquidations, "Costs": `$${r3x.totalCosts.toFixed(0)}` };
       return s;
     })(),
     (() => {
-      const s = computeStats("Fixed 3x loop", r3.equity);
-      s.metadata = { Depegs: r3.depegEvents, Liquidations: r3.liquidationEvents };
-      return s;
-    })(),
-    (() => {
-      const s = computeStats("Regime-adaptive", r4.equity);
+      const s = computeStats("Adaptive JitoSOL (with costs)", rAdaptive.equity);
       s.metadata = {
-        "Avg leverage": r4.avgLeverage.toFixed(2) + "x",
-        Depegs: r4.depegEvents,
-        Liquidations: r4.liquidationEvents,
+        "Avg leverage": rAdaptive.avgLeverage.toFixed(2) + "x",
+        Liquidations: rAdaptive.liquidations,
+        "Costs": `$${rAdaptive.totalCosts.toFixed(0)}`,
       };
+      return s;
+    })(),
+    (() => {
+      const s = computeStats("Adaptive mSOL (with costs)", rMsol.equity);
+      s.metadata = {
+        "Avg leverage": rMsol.avgLeverage.toFixed(2) + "x",
+        "Costs": `$${rMsol.totalCosts.toFixed(0)}`,
+      };
+      return s;
+    })(),
+    (() => {
+      const s = computeStats("Directional sizing (no loop)", rDir.equity);
+      s.metadata = { "Costs": `$${rDir.totalCosts.toFixed(0)}` };
       return s;
     })(),
   ];

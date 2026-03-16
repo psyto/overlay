@@ -1,20 +1,12 @@
 /**
- * Backtest: Liquidation Density
+ * Backtest: Liquidation Density (v3)
  *
- * 1000 daily candles (~3 years)
- * Starting capital: $100,000
- *
- * Improved model:
- * - Liquidation clusters generated from support/resistance + round numbers
- * - Counter-trades triggered only when price rapidly approaches dense zones
- * - Asymmetric TP/SL: TP 3% / SL 1.5% (cascade flush gives larger moves)
- * - Max hold time: 5 days
- * - Density filter: only trade when cluster score >= 3
- *
- * Compares:
- * 1. USDC only
- * 2. Naive: short on any 3%+ daily drop
- * 3. Density-targeted with vol regime sizing (our strategy)
+ * Fixes:
+ * - Execution costs: Drift fees, slippage, Jito tips
+ * - Max 1 concurrent trade (correlation risk)
+ * - Gap risk modeling: SL doesn't execute at target during flash crashes
+ * - Wider TP/SL to account for friction: TP 5% / SL 2%
+ * - Cooldown: 5 days between trades
  */
 
 import {
@@ -24,21 +16,26 @@ import {
   Candle,
 } from "./data-fetcher";
 import { computeStats, printComparison, exportCsv, EquityPoint } from "./reporting";
+import { calculateTradeCost, jitoTipUsd } from "./execution-costs";
 
 const STARTING_CAPITAL = 100_000;
-const MAX_TRADE_SIZE = 30_000;
-const MAX_CONCURRENT = 3;
-const TP_PCT = 3.0;
-const SL_PCT = 1.5;
+const MAX_TRADE_SIZE = 20_000;   // Reduced from 30K
+const MAX_CONCURRENT = 1;        // Down from 3 — correlation risk
+const TP_PCT = 5.0;              // Wider TP to account for costs
+const SL_PCT = 2.0;              // Wider SL to account for gap risk
 const MAX_HOLD_DAYS = 5;
-const DRIFT_FEE_BPS = 3.5;
-const USDC_YIELD = 0.045;
+const COOLDOWN_DAYS = 5;         // Longer cooldown
 const MIN_DENSITY = 4;
-const COOLDOWN_DAYS = 3; // Wait 3 days between new entries
+const USDC_YIELD = 0.045;
+
+// Gap risk: during flash crashes, SL executes worse than target
+// Model: if daily range > 8%, SL slips by 50% of the excess
+const GAP_THRESHOLD_PCT = 8.0;
+const GAP_SLIP_FACTOR = 0.5;
 
 interface Cluster {
   price: number;
-  score: number; // 1-5
+  score: number;
   direction: "long_liq" | "short_liq";
 }
 
@@ -49,6 +46,7 @@ interface Trade {
   tpPrice: number;
   slPrice: number;
   entryIdx: number;
+  entryCost: number;
 }
 
 function generateClusters(candles: Candle[], idx: number, lookback: number = 60): Cluster[] {
@@ -59,60 +57,47 @@ function generateClusters(candles: Candle[], idx: number, lookback: number = 60)
 
   const clusters: Cluster[] = [];
 
-  // Find swing lows (support) and swing highs (resistance)
   for (let i = 3; i < window.length - 3; i++) {
-    const isSwingLow = window[i].low < window[i - 1].low && window[i].low < window[i + 1].low &&
-                       window[i].low < window[i - 2].low && window[i].low < window[i + 2].low;
-    const isSwingHigh = window[i].high > window[i - 1].high && window[i].high > window[i + 1].high &&
-                        window[i].high > window[i - 2].high && window[i].high > window[i + 2].high;
+    const isLow = window[i].low < window[i - 1].low && window[i].low < window[i + 1].low &&
+                  window[i].low < window[i - 2].low && window[i].low < window[i + 2].low;
+    const isHigh = window[i].high > window[i - 1].high && window[i].high > window[i + 1].high &&
+                   window[i].high > window[i - 2].high && window[i].high > window[i + 2].high;
 
-    if (isSwingLow) {
-      const liqPrice = window[i].low * 0.93; // 7% below support (leveraged long liquidation)
+    if (isLow) {
+      const liqPrice = window[i].low * 0.93;
       const dist = ((current - liqPrice) / current) * 100;
       if (dist > 0 && dist < 15) {
-        // Score: closer = denser, more recent = denser
         const recencyBonus = Math.min(2, (lookback - i) / 20);
-        const proximityScore = Math.max(1, Math.round(5 - dist / 3));
-        clusters.push({
-          price: liqPrice,
-          score: Math.min(5, proximityScore + Math.round(recencyBonus)),
-          direction: "long_liq",
-        });
+        const score = Math.min(5, Math.max(1, Math.round(5 - dist / 3)) + Math.round(recencyBonus));
+        clusters.push({ price: liqPrice, score, direction: "long_liq" });
       }
     }
-
-    if (isSwingHigh) {
+    if (isHigh) {
       const liqPrice = window[i].high * 1.07;
       const dist = ((liqPrice - current) / current) * 100;
       if (dist > 0 && dist < 15) {
         const recencyBonus = Math.min(2, (lookback - i) / 20);
-        const proximityScore = Math.max(1, Math.round(5 - dist / 3));
-        clusters.push({
-          price: liqPrice,
-          score: Math.min(5, proximityScore + Math.round(recencyBonus)),
-          direction: "short_liq",
-        });
+        const score = Math.min(5, Math.max(1, Math.round(5 - dist / 3)) + Math.round(recencyBonus));
+        clusters.push({ price: liqPrice, score, direction: "short_liq" });
       }
     }
   }
 
-  // Volume-weighted recent low clusters
+  // Recent support/resistance
   const recentLow = Math.min(...candles.slice(idx - 10, idx).map((c) => c.low));
   const recentHigh = Math.max(...candles.slice(idx - 10, idx).map((c) => c.high));
 
   if (recentLow > 0) {
     const liqPrice = recentLow * 0.95;
     const dist = ((current - liqPrice) / current) * 100;
-    if (dist > 0 && dist < 10) {
+    if (dist > 0 && dist < 10)
       clusters.push({ price: liqPrice, score: 4, direction: "long_liq" });
-    }
   }
   if (recentHigh > 0) {
     const liqPrice = recentHigh * 1.05;
     const dist = ((liqPrice - current) / current) * 100;
-    if (dist > 0 && dist < 10) {
+    if (dist > 0 && dist < 10)
       clusters.push({ price: liqPrice, score: 4, direction: "short_liq" });
-    }
   }
 
   return clusters;
@@ -122,12 +107,12 @@ function simulateTrading(
   candles: Candle[],
   volData: Array<{ timestamp: number; volBps: number }>,
   useDensityFilter: boolean,
-  useVolSizing: boolean
-): { equity: EquityPoint[]; trades: number; wins: number } {
+  withCosts: boolean
+): { equity: EquityPoint[]; trades: number; wins: number; totalCosts: number } {
   const equity: EquityPoint[] = [];
   let capital = STARTING_CAPITAL;
   const active: Trade[] = [];
-  let totalTrades = 0, wins = 0;
+  let totalTrades = 0, wins = 0, totalCosts = 0;
   let lastEntryIdx = -999;
 
   const volMap = new Map(volData.map((v) => [v.timestamp, v.volBps]));
@@ -139,22 +124,43 @@ function simulateTrading(
 
     const volBps = volMap.get(c.timestamp) ?? 3500;
     const volRegime = classifyVolRegime(volBps);
-    const dailyReturn = (c.close - prev.close) / prev.close;
+    const dailyRange = c.high > 0 ? ((c.high - c.low) / c.high) * 100 : 0;
 
     // Check exits
     for (let j = active.length - 1; j >= 0; j--) {
       const t = active[j];
-      let exit = false, pnlPct = 0;
+      let exit = false, pnlPct = 0, reason = "";
 
       if (t.direction === "short") {
-        if (c.low <= t.tpPrice) { pnlPct = TP_PCT; exit = true; }
-        else if (c.high >= t.slPrice) { pnlPct = -SL_PCT; exit = true; }
+        if (c.low <= t.tpPrice) { pnlPct = TP_PCT; exit = true; reason = "TP"; }
+        else if (c.high >= t.slPrice) {
+          pnlPct = -SL_PCT;
+          // Gap risk: if daily range is extreme, SL slips
+          if (dailyRange > GAP_THRESHOLD_PCT) {
+            const extraSlip = (dailyRange - GAP_THRESHOLD_PCT) * GAP_SLIP_FACTOR;
+            pnlPct -= extraSlip;
+            reason = `SL+gap(${extraSlip.toFixed(1)}%)`;
+          } else {
+            reason = "SL";
+          }
+          exit = true;
+        }
       } else {
-        if (c.high >= t.tpPrice) { pnlPct = TP_PCT; exit = true; }
-        else if (c.low <= t.slPrice) { pnlPct = -SL_PCT; exit = true; }
+        if (c.high >= t.tpPrice) { pnlPct = TP_PCT; exit = true; reason = "TP"; }
+        else if (c.low <= t.slPrice) {
+          pnlPct = -SL_PCT;
+          if (dailyRange > GAP_THRESHOLD_PCT) {
+            const extraSlip = (dailyRange - GAP_THRESHOLD_PCT) * GAP_SLIP_FACTOR;
+            pnlPct -= extraSlip;
+            reason = `SL+gap(${extraSlip.toFixed(1)}%)`;
+          } else {
+            reason = "SL";
+          }
+          exit = true;
+        }
       }
 
-      // Time-based exit
+      // Time exit
       if (!exit && i - t.entryIdx >= MAX_HOLD_DAYS) {
         if (t.direction === "short") {
           pnlPct = ((t.entryPrice - c.close) / t.entryPrice) * 100;
@@ -162,22 +168,27 @@ function simulateTrading(
           pnlPct = ((c.close - t.entryPrice) / t.entryPrice) * 100;
         }
         exit = true;
+        reason = "timeout";
       }
 
       if (exit) {
         const pnlUsd = t.sizeUsd * (pnlPct / 100);
-        const fee = t.sizeUsd * 2 * DRIFT_FEE_BPS / 10000;
-        capital += pnlUsd - fee;
-        if (pnlUsd > fee) wins++;
+        let exitCost = 0;
+        if (withCosts) {
+          const cost = calculateTradeCost(t.sizeUsd, c.close);
+          exitCost = cost.totalUsd + jitoTipUsd(c.close);
+        }
+        capital += pnlUsd - t.entryCost - exitCost;
+        totalCosts += t.entryCost + exitCost;
+        if (pnlUsd > t.entryCost + exitCost) wins++;
         totalTrades++;
         active.splice(j, 1);
       }
     }
 
-    // New entries (with cooldown)
-    if (active.length < MAX_CONCURRENT && i - lastEntryIdx >= (useDensityFilter ? COOLDOWN_DAYS : 1)) {
+    // New entries
+    if (active.length < MAX_CONCURRENT && i - lastEntryIdx >= COOLDOWN_DAYS) {
       if (useDensityFilter) {
-        // Density-targeted: only trade near dense clusters
         const clusters = generateClusters(candles, i);
         const nearby = clusters.filter((cl) => {
           const dist = Math.abs((c.close - cl.price) / c.close) * 100;
@@ -188,26 +199,42 @@ function simulateTrading(
           const best = nearby.sort((a, b) => b.score - a.score)[0];
           const dir: "short" | "long" = best.direction === "long_liq" ? "short" : "long";
 
-          // Vol-based sizing
-          const volMult = useVolSizing
-            ? (volRegime === "extreme" ? 0.3 : volRegime === "high" ? 0.5 : volRegime === "normal" ? 0.7 : 1.0)
-            : 1.0;
-          const size = Math.min(MAX_TRADE_SIZE * (best.score / 5) * volMult, capital * 0.15);
+          const volMult = volRegime === "extreme" ? 0.3 : volRegime === "high" ? 0.5 : 0.7;
+          const size = Math.min(MAX_TRADE_SIZE * (best.score / 5) * volMult, capital * 0.1);
 
           if (size >= 500) {
+            let entryCost = 0;
+            if (withCosts) {
+              const cost = calculateTradeCost(size, c.close);
+              entryCost = cost.totalUsd + jitoTipUsd(c.close);
+            }
+
             const tp = dir === "short" ? c.close * (1 - TP_PCT / 100) : c.close * (1 + TP_PCT / 100);
             const sl = dir === "short" ? c.close * (1 + SL_PCT / 100) : c.close * (1 - SL_PCT / 100);
-            active.push({ entryPrice: c.close, direction: dir, sizeUsd: size, tpPrice: tp, slPrice: sl, entryIdx: i });
+            active.push({
+              entryPrice: c.close, direction: dir, sizeUsd: size,
+              tpPrice: tp, slPrice: sl, entryIdx: i, entryCost,
+            });
             lastEntryIdx = i;
           }
         }
       } else {
-        // Naive: short on any significant daily drop
+        // Naive: short on 3%+ daily drop
+        const dailyReturn = (c.close - prev.close) / prev.close;
         if (dailyReturn < -0.03) {
-          const size = Math.min(MAX_TRADE_SIZE, capital * 0.15);
+          const size = Math.min(MAX_TRADE_SIZE, capital * 0.1);
+          let entryCost = 0;
+          if (withCosts) {
+            const cost = calculateTradeCost(size, c.close);
+            entryCost = cost.totalUsd + jitoTipUsd(c.close);
+          }
+
           const tp = c.close * (1 - TP_PCT / 100);
           const sl = c.close * (1 + SL_PCT / 100);
-          active.push({ entryPrice: c.close, direction: "short", sizeUsd: size, tpPrice: tp, slPrice: sl, entryIdx: i });
+          active.push({
+            entryPrice: c.close, direction: "short", sizeUsd: size,
+            tpPrice: tp, slPrice: sl, entryIdx: i, entryCost,
+          });
           lastEntryIdx = i;
         }
       }
@@ -221,7 +248,7 @@ function simulateTrading(
     equity.push({ timestamp: c.timestamp, equity: Math.max(capital, 0) });
   }
 
-  return { equity, trades: totalTrades, wins };
+  return { equity, trades: totalTrades, wins, totalCosts };
 }
 
 function simulateUsdc(candles: Candle[]): EquityPoint[] {
@@ -235,33 +262,44 @@ function simulateUsdc(candles: Candle[]): EquityPoint[] {
 }
 
 async function main(): Promise<void> {
-  console.log("=== Liquidation Density Backtest ===\n");
+  console.log("=== Liquidation Density Backtest (v3 — costs + gap risk) ===\n");
 
   const candles = await fetchCandles("SOL-PERP", "D", 1000);
   console.log(`Loaded ${candles.length} daily candles`);
-  const startDate = new Date(candles[0].timestamp * 1000).toISOString().split("T")[0];
-  const endDate = new Date(candles[candles.length - 1].timestamp * 1000).toISOString().split("T")[0];
-  console.log(`Range: ${startDate} to ${endDate}`);
-  const prices = candles.map((c) => c.close).filter((p) => p > 0);
-  console.log(`SOL: $${Math.min(...prices).toFixed(2)} — $${Math.max(...prices).toFixed(2)}`);
-  console.log(`TP: ${TP_PCT}% | SL: ${SL_PCT}% | Max hold: ${MAX_HOLD_DAYS}d\n`);
+  const s = new Date(candles[0].timestamp * 1000).toISOString().split("T")[0];
+  const e = new Date(candles[candles.length - 1].timestamp * 1000).toISOString().split("T")[0];
+  console.log(`Range: ${s} to ${e}`);
+  console.log(`TP: ${TP_PCT}% | SL: ${SL_PCT}% | Max hold: ${MAX_HOLD_DAYS}d | Cooldown: ${COOLDOWN_DAYS}d`);
+  console.log(`Max concurrent: ${MAX_CONCURRENT} | Gap threshold: ${GAP_THRESHOLD_PCT}%\n`);
 
   const volData = computeRollingVol(candles, 30);
 
-  const naive = simulateTrading(candles, volData, false, false);
-  const density = simulateTrading(candles, volData, true, true);
+  const naiveNoCost = simulateTrading(candles, volData, false, false);
+  const naiveCost = simulateTrading(candles, volData, false, true);
+  const densityNoCost = simulateTrading(candles, volData, true, false);
+  const densityCost = simulateTrading(candles, volData, true, true);
 
   const results = [
     computeStats("USDC only (4.5%)", simulateUsdc(candles)),
     (() => {
-      const s = computeStats("Naive momentum short", naive.equity);
-      s.metadata = { Trades: naive.trades, Wins: naive.wins, "Win%": `${((naive.wins / Math.max(naive.trades, 1)) * 100).toFixed(0)}%` };
-      return s;
+      const r = computeStats("Naive momentum (no costs)", naiveNoCost.equity);
+      r.metadata = { Trades: naiveNoCost.trades, Wins: naiveNoCost.wins, "Win%": `${((naiveNoCost.wins / Math.max(naiveNoCost.trades, 1)) * 100).toFixed(0)}%` };
+      return r;
     })(),
     (() => {
-      const s = computeStats("Density-targeted + vol sizing", density.equity);
-      s.metadata = { Trades: density.trades, Wins: density.wins, "Win%": `${((density.wins / Math.max(density.trades, 1)) * 100).toFixed(0)}%` };
-      return s;
+      const r = computeStats("Naive momentum (with costs)", naiveCost.equity);
+      r.metadata = { Trades: naiveCost.trades, Wins: naiveCost.wins, "Win%": `${((naiveCost.wins / Math.max(naiveCost.trades, 1)) * 100).toFixed(0)}%`, Costs: `$${naiveCost.totalCosts.toFixed(0)}` };
+      return r;
+    })(),
+    (() => {
+      const r = computeStats("Density-targeted (no costs)", densityNoCost.equity);
+      r.metadata = { Trades: densityNoCost.trades, Wins: densityNoCost.wins, "Win%": `${((densityNoCost.wins / Math.max(densityNoCost.trades, 1)) * 100).toFixed(0)}%` };
+      return r;
+    })(),
+    (() => {
+      const r = computeStats("Density-targeted (with costs)", densityCost.equity);
+      r.metadata = { Trades: densityCost.trades, Wins: densityCost.wins, "Win%": `${((densityCost.wins / Math.max(densityCost.trades, 1)) * 100).toFixed(0)}%`, Costs: `$${densityCost.totalCosts.toFixed(0)}` };
+      return r;
     })(),
   ];
 
