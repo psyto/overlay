@@ -6,40 +6,51 @@ Each strategy is a thin keeper that wires together existing protocol SDKs and re
 
 ## Strategies
 
-### Regime-Adaptive Leverage
+### JLP Trend-Aware Delta Hedge ⭐ Primary
 
-Leveraged JitoSOL loop on Kamino with dynamic leverage driven by multi-dimensional signal detection and volatility regime classification.
-
-- **Yield source:** JitoSOL staking (~7.5%) amplified by Kamino eMode leverage loop
-- **Edge:** Leverage scales inversely with risk — high in calm markets, low in volatile ones
-- **Signal detection:** 4-dimensional anomaly scoring (OI shift, liquidation cascade, funding volatility, spread blow-out)
-- **Safety:** Pre-extreme wind-down deleverages early at 65% vol before regime flips
-
-| Regime | Signal Clear | Signal Low | Signal High | Signal Critical |
-|--------|-------------|-----------|-------------|-----------------|
-| veryLow | 3.5x | 3.0x | 2.0x | 1.0x |
-| low | 3.0x | 2.5x | 1.5x | 1.0x |
-| normal | 2.5x | 2.0x | 1.5x | 1.0x |
-| high | 1.5x | 1.0x | 1.0x | 1.0x |
-| extreme | 1.0x | 1.0x | 1.0x | 1.0x |
-
-### JLP Trend-Aware Delta Hedge
-
-Hold JLP for fee yield (~25% APY from Jupiter perp volume), with trend-aware delta hedging on Drift to reduce drawdowns.
+Hold JLP for fee yield (~25% APY from Jupiter perp volume), with trend-aware delta hedging on Drift to reduce drawdowns without sacrificing bull market upside.
 
 - **Yield source:** JLP fee income from Jupiter perpetual traders
-- **Edge:** Delta hedge active in bear/range markets, disabled in bull — captures upside while reducing downside
-- **Trend detection:** 30/60-day SMA crossover classifies bull/bear/range
-- **Backtest:** +270% over 3 years with 1.30 Sharpe (vs +225% unhedged with 1.02 Sharpe)
+- **Edge:** Delta hedge active in bear/range, off in bull — captures upside while protecting downside
+- **Trend detection:** OI/funding leading indicator (7d momentum + volume trend + funding direction)
+- **Backtest (v3, with costs):** +711% over 3 years, 2.44 Sharpe, 16% max drawdown
+- **Status:** Devnet tested, ready for mainnet
+
+| Strategy | Return | Ann. Return | Max DD | Sharpe |
+|----------|--------|-------------|--------|--------|
+| USDC only | +12% | 4.6% | 0% | 44.2 |
+| JLP unhedged | +225% | 58.2% | 50.6% | 1.02 |
+| JLP + SMA delta (with costs) | +220% | 57.2% | 40.9% | 1.12 |
+| **JLP + OI/funding delta (with costs)** | **+711%** | **125.8%** | **16.2%** | **2.44** |
+
+### Directional Sizing
+
+Regime-based SOL allocation — no leverage loop, just adjust SOL vs USDC weighting by vol regime and signal severity.
+
+- **Yield source:** SOL price appreciation + JitoSOL staking yield on SOL portion, USDC yield on idle
+- **Edge:** Simple vol-targeting applied to SOL — more SOL in calm markets, less in volatile
+- **Backtest (v3, with costs):** +27% over 3 years, 9.5% annualized, $443 total costs
+
+Replaces the original "Regime-Adaptive Leverage" strategy, which backtested at only +13% (barely beating 1x JitoSOL staking) due to the JitoSOL/SOL spread being too thin to justify loop complexity.
 
 ### Liquidation Density
 
-Map leveraged positions across Kamino and Marginfi, build a liquidation heatmap, and trade around cascade events.
+Map leveraged positions across Marginfi (and Kamino), build a real-time liquidation heatmap, and trade around cascade events.
 
-- **Yield source:** Counter-trading liquidation cascades (short into forced selling, close after flush)
-- **Edge:** On-chain position scanning identifies where cascades will trigger before they happen
-- **Execution:** Drift perp orders with take-profit/stop-loss triggers, Jito Bundles for atomicity
-- **Risk:** Asymmetric TP/SL (3% / 1.5%), max 3 concurrent trades, vol-based position sizing
+- **Yield source:** Counter-trading liquidation cascades on Drift perps
+- **Edge:** On-chain position scanning from real Marginfi accounts (509K scanned)
+- **Execution:** Drift perp orders with asymmetric TP/SL (5%/2%), max 1 concurrent trade, gap risk modeling
+- **Status:** Real heatmap working on mainnet — found 260 leveraged SOL positions in 20K account sample
+
+Example heatmap output (real mainnet data, Mar 2026):
+```
+$52 (-45%) [CRIT] $132.6K ( 36) ██████████████████████████████████████████████████
+$47 (-50%) [HIGH] $ 73.4K ( 16) ████████████████████████████
+$68 (-28%) [HIGH] $ 52.4K ( 33) ████████████████████
+$73 (-22%) [ MED] $ 41.5K ( 35) ████████████████
+$89 (  -5%) [ LOW] $  9.0K (  6) ███
+$94 (+  1%) [ LOW] $  0.1K (  1) █ ◄ CURRENT
+```
 
 ## Architecture
 
@@ -47,15 +58,24 @@ Map leveraged positions across Kamino and Marginfi, build a liquidation heatmap,
 overlay/
 ├── packages/
 │   ├── shared/           Keypair loading, Drift client, order helpers
-│   ├── kamino-client/    Kamino Lend SDK wrapper (loop mgmt, position scanning)
+│   ├── kamino-client/    Kamino Lend SDK wrapper (on-chain position scanning)
 │   ├── jlp-client/       Jupiter JLP wrapper (pool state, deposit/withdraw)
-│   └── marginfi-client/  Marginfi wrapper (position scanning, liquidation)
+│   └── marginfi-client/  Marginfi wrapper (509K account scanning, liquidation)
 ├── strategies/
-│   ├── regime-leverage/  Keeper: signal → regime → Kamino loop adjustment
-│   ├── jlp-gamma-hedge/  Keeper: trend → delta hedge → Greeks monitoring
+│   ├── jlp-gamma-hedge/  Keeper: OI/funding trend → delta hedge → Greeks
+│   ├── regime-leverage/  Keeper: signal → regime → Kamino loop / directional sizing
 │   └── liquidation-density/  Keeper: scan → heatmap → counter-trade
-├── backtests/            3-year daily backtests with comparison tables + CSV
-└── scripts/              Devnet setup, funding, and integration tests
+├── backtests/            v3 backtests with execution costs, OI signals, gap risk
+│   └── src/
+│       ├── execution-costs.ts   Drift fees, slippage model, Jito tips, funding drag
+│       ├── data-fetcher.ts      Drift Data API (1000 daily candles)
+│       └── reporting.ts         Stats, comparison tables, CSV export
+└── scripts/
+    ├── devnet-setup.ts          Initialize Drift account on devnet
+    ├── devnet-fund.ts           Mint devnet USDC via TokenFaucet
+    ├── devnet-jlp-hedge-test.ts 7-step integration test (all passing)
+    ├── mainnet-scan-lite.ts     Lightweight real heatmap from Marginfi
+    └── mainnet-scan-test.ts     Full SDK-based scanner (needs paid RPC)
 ```
 
 ## Composability
@@ -65,42 +85,46 @@ Each strategy reuses modules from a shared infrastructure toolkit:
 | Module | Origin | Used by |
 |--------|--------|---------|
 | Signal detector (4D anomaly) | Vigil/Yogi pattern | All three |
-| Vol estimator (Parkinson) | Kuma/Tempest pattern | regime-leverage, jlp-gamma-hedge |
-| Regime engine (vol × severity matrix) | Yogi pattern | regime-leverage |
-| Pre-extreme wind-down | Arashi pattern | regime-leverage |
-| Health monitor (LTV + drawdown) | Kuma pattern | regime-leverage |
-| Portfolio Greeks (delta/gamma/vega) | Tensor pattern | jlp-gamma-hedge |
-| Heatmap density classification | Kalshify pattern | liquidation-density |
-| Drift order helpers | Shared package | jlp-gamma-hedge, liquidation-density |
-| Jito Bundle execution | Sentinel pattern | liquidation-density |
+| Vol estimator (Parkinson) | Kuma/Tempest pattern | JLP hedge, Directional sizing |
+| Regime engine (vol × severity matrix) | Yogi pattern | Directional sizing |
+| Pre-extreme wind-down | Arashi pattern | Directional sizing |
+| Health monitor (LTV + drawdown) | Kuma pattern | Regime-leverage |
+| Portfolio Greeks (delta/gamma/vega) | Tensor pattern | JLP hedge |
+| Heatmap density classification | Kalshify pattern | Liquidation density |
+| Drift order helpers | Shared package | JLP hedge, Liquidation density |
+| On-chain position scanner | Marginfi binary parser | Liquidation density |
 
-## Backtest Results (Jun 2023 — Mar 2026)
+## Backtest Results (v3 — with execution costs)
 
-### Regime-Adaptive Leverage
+### JLP Delta Hedge (Jun 2023 — Mar 2026)
 
-| Strategy | Return | Ann. Return | Max DD | Sharpe |
-|----------|--------|-------------|--------|--------|
-| 1x JitoSOL | +12.7% | 4.6% | 2.3% | 0.01 |
-| Fixed 2x | +3.7% | 1.4% | 6.2% | -0.93 |
-| Fixed 3x | -4.7% | -1.8% | 12.2% | -1.24 |
-| **Regime-adaptive** | **+13.0%** | **4.7%** | **2.3%** | **0.08** |
-
-### JLP Trend-Aware Delta Hedge
+Compares SMA-based (lagging) vs OI/funding-based (leading) trend detection:
 
 | Strategy | Return | Ann. Return | Max DD | Sharpe |
 |----------|--------|-------------|--------|--------|
-| USDC only | +12.3% | 4.6% | 0.0% | 44.2 |
-| JLP unhedged | +224.6% | 58.1% | 50.6% | 1.02 |
-| JLP + always delta | -58.6% | -29.0% | 68.9% | -1.00 |
-| **JLP + trend-aware delta** | **+270.5%** | **66.4%** | **38.5%** | **1.30** |
+| USDC only | +12% | 4.6% | 0% | 44.2 |
+| JLP unhedged | +225% | 58.2% | 50.6% | 1.02 |
+| JLP + SMA delta (with costs) | +220% | 57.2% | 40.9% | 1.12 |
+| **JLP + OI/funding delta (with costs)** | **+711%** | **125.8%** | **16.2%** | **2.44** |
 
-### Liquidation Density
+### Directional Sizing (Jun 2023 — Mar 2026)
 
-| Strategy | Return | Ann. Return | Max DD | Trades | Win% |
-|----------|--------|-------------|--------|--------|------|
-| USDC only | +12.3% | 4.6% | 0.0% | — | — |
-| Naive momentum | +48.8% | 16.7% | 0.8% | 199 | 56% |
-| **Density-targeted** | **+34.2%** | **12.1%** | **0.9%** | **192** | **55%** |
+| Strategy | Return | Ann. Return | Max DD | Costs |
+|----------|--------|-------------|--------|-------|
+| SOL buy & hold | +266% | 63.1% | 70.2% | $0 |
+| 1x JitoSOL | +13% | 4.6% | 2.3% | $0 |
+| Fixed 3x loop (with costs) | -11% | -4.5% | 15.0% | $10K |
+| **Directional sizing** | **+27%** | **9.5%** | **11.8%** | **$443** |
+
+### Liquidation Density (Jun 2023 — Mar 2026)
+
+| Strategy | Return | Ann. Return | Max DD | Trades | Win% | Costs |
+|----------|--------|-------------|--------|--------|------|-------|
+| USDC only | +12% | 4.6% | 0% | — | — | — |
+| Naive momentum (with costs) | +19% | 7.1% | 0.8% | 105 | 42% | $1,042 |
+| Density-targeted (with costs) | +16% | 5.9% | 1.3% | 132 | 38% | $1,005 |
+
+Note: Density strategy uses synthetic clusters. Real on-chain data expected to improve differentiation.
 
 ## Quick Start
 
@@ -119,13 +143,12 @@ pnpm install
 ### Backtest
 
 ```bash
-# Run all backtests
-npx ts-node backtests/src/regime-leverage-backtest.ts
 npx ts-node backtests/src/jlp-gamma-hedge-backtest.ts
+npx ts-node backtests/src/regime-leverage-backtest.ts
 npx ts-node backtests/src/liquidation-density-backtest.ts
 ```
 
-### Devnet Test
+### Devnet Test (JLP Delta Hedge)
 
 ```bash
 # 1. Create devnet keypair
@@ -142,11 +165,19 @@ solana airdrop 2 $(solana-keygen pubkey ~/devnet-keypair.json) --url devnet
 npx ts-node --transpile-only scripts/devnet-setup.ts
 npx ts-node --transpile-only scripts/devnet-fund.ts
 
-# 5. Run integration test
+# 5. Run 7-step integration test
 npx ts-node --transpile-only scripts/devnet-jlp-hedge-test.ts
 ```
 
-### Mainnet
+### Mainnet Liquidation Heatmap
+
+```bash
+# Scan real Marginfi positions (needs RPC with decent rate limits)
+RPC_URL="https://mainnet.helius-rpc.com/?api-key=YOUR_KEY" \
+  npx ts-node --transpile-only scripts/mainnet-scan-lite.ts
+```
+
+### Mainnet Keeper
 
 ```bash
 # Edit .env with mainnet RPC and keypair
@@ -154,18 +185,39 @@ npx ts-node --transpile-only scripts/devnet-jlp-hedge-test.ts
 npx ts-node --transpile-only strategies/jlp-gamma-hedge/src/keeper/index.ts
 ```
 
+## Execution Cost Model
+
+All v3 backtests include realistic friction:
+
+| Cost | Model |
+|------|-------|
+| Drift taker fee | 3.5 bps per trade |
+| Slippage | √(size/$10K) × 1 bps (sqrt model for deep books) |
+| Jito tips | ~$0.01 per bundle |
+| Priority fees | ~$0.005 per tx |
+| Funding drag | 0.01%/day on shorts during bull markets |
+| Kamino borrow | 1.5-12% annualized (varies by vol regime) |
+
 ## Technical Stack
 
 | Component | Technology |
 |-----------|-----------|
 | Runtime | Node.js + TypeScript |
 | Solana | @solana/web3.js v1, @solana/kit v2 |
-| DEX | Drift Protocol v2 (perps, oracle) |
-| Lending | Kamino Lend (@kamino-finance/klend-sdk) |
-| Lending | Marginfi (@mrgnlabs/marginfi-client-v2) |
+| DEX | Drift Protocol v2 (perps, oracle, devnet faucet) |
+| Lending | Kamino Lend (on-chain binary parsing) |
+| Lending | Marginfi v2 (509K account scanning, i80f48 decoding) |
 | LP | Jupiter JLP (Swap API + Earn API) |
 | Execution | Jito Bundles (via Sentinel pattern) |
+| Data | Drift Data API (1000 daily candles, live market stats) |
 | Monorepo | pnpm workspaces |
+
+## Known Limitations
+
+- **Liquidation density backtest** uses synthetic clusters — real on-chain data scanner is working but needs paid RPC for full 509K account scan
+- **JLP gamma hedge (VolSwap)** component not yet beneficial — trend-aware delta hedge alone outperforms. VolSwap adds value only in sustained bear/range markets
+- **Regime-adaptive leverage loop** adds no value over simple staking — the JitoSOL/SOL spread is too thin. Directional sizing is the better use of the regime engine
+- **Share rate conversion** for Marginfi positions uses on-chain bank data but may have precision loss in i80f48 decoding for very large positions
 
 ## License
 

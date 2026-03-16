@@ -1,52 +1,53 @@
-# Regime-Adaptive Leverage
+# Regime-Adaptive Leverage / Directional Sizing
 
-Leveraged JitoSOL loop on Kamino with dynamic leverage driven by multi-dimensional signal detection and volatility regime classification.
+Two approaches to using the 4D signal detection + vol regime engine for yield:
 
-## How It Works
+## Approach 1: Directional Sizing (Recommended)
 
-1. Deposit JitoSOL on Kamino (Jito market, eMode)
-2. Borrow SOL against JitoSOL collateral
-3. Mint more JitoSOL with borrowed SOL
-4. Repeat until target leverage reached
-5. Keeper adjusts leverage every 30 minutes based on regime
+Regime-based SOL allocation — no Kamino loop, just adjust SOL vs USDC weighting.
 
-The regime is determined by two inputs:
+- **Bull-friendly**: more SOL in calm markets, more USDC in volatile
+- **Simple**: no leverage, no liquidation risk, minimal costs
+- **Backtest**: +27%, 9.5% annualized, $443 costs over 3 years
 
-- **Volatility regime** (backward-looking): Parkinson estimator on SOL hourly candles
-- **Signal severity** (forward-looking): 4-dimensional anomaly detection on Drift markets
+| Regime | Signal Clear | Signal High | Signal Critical |
+|--------|-------------|------------|-----------------|
+| veryLow | 80% SOL | 40% SOL | 0% SOL |
+| low | 60% SOL | 30% SOL | 0% SOL |
+| normal | 40% SOL | 20% SOL | 0% SOL |
+| high | 20% SOL | 10% SOL | 0% SOL |
+| extreme | 0% SOL | 0% SOL | 0% SOL |
 
-## Keeper Loop
+## Approach 2: Kamino Leverage Loop (Not Recommended)
 
-```
-Every 30s:  Emergency checks (LTV, drawdown, signal severity)
-Every 5min: Signal detection (OI shift, liquidation cascade, funding vol, spread)
-Every 10min: Vol estimation update
-Every 30min: Rebalance loop leverage to match regime target
-```
+Leveraged JitoSOL loop on Kamino with dynamic leverage.
+
+**Why it underperforms**: The JitoSOL/SOL spread (~3.5% net) is too thin. After borrow rate fluctuation (4-12% depending on vol), rebalance costs, and depeg events, the loop barely beats simple 1x staking (+13% vs +12.7% over 3 years). The regime engine correctly stays near 1x in high-vol environments, which makes the loop pointless.
+
+| Strategy | Return | Ann. Return | Max DD |
+|----------|--------|-------------|--------|
+| SOL buy & hold | +266% | 63.1% | 70.2% |
+| 1x JitoSOL | +13% | 4.6% | 2.3% |
+| Fixed 3x loop | -11% | -4.5% | 15.0% |
+| Adaptive loop | +13% | 4.7% | 2.3% |
+| **Directional sizing** | **+27%** | **9.5%** | **11.8%** |
+
+## Signal Detection (Shared)
+
+Both approaches use the same 4D anomaly detector from Yogi:
+
+1. **OI Imbalance Shift** — rapid long/short ratio change
+2. **Liquidation Cascade** — sudden OI drop (forced selling proxy)
+3. **Funding Rate Volatility** — unstable funding = regime transition
+4. **Spread Blow-out** — mark/oracle divergence = stress
 
 ## Composed From
 
 | Module | Source | Purpose |
 |--------|--------|---------|
-| Signal detector | Yogi (`drift-signal-detector.ts`) | 4D anomaly scoring |
-| Regime engine | Yogi (`regime-engine.ts`) | Vol × severity → leverage matrix |
-| Vol estimator | Kuma (`leverage-controller.ts`) | Parkinson on SOL candles |
-| Health monitor | Kuma (`health-monitor.ts`) | LTV + drawdown checks |
-| Pre-extreme wind-down | Arashi | Early deleverage at 65% vol |
-| Loop manager | New | Kamino-specific loop operations |
-
-## Configuration
-
-Key parameters in `src/config/vault.ts`:
-
-- `targetLtvPct`: Conservative LTV cap (default: 80%, eMode allows 95%)
-- `loopLeverageMatrix`: Regime × severity → target leverage
-- `preExtremeWindDownVolBps`: Early deleverage threshold (6500 bps)
-- `enableDriftHedge`: Optional SOL short for delta-neutral mode
-
-## Risk Model
-
-- JitoSOL/SOL depeg is the primary risk at high leverage
-- At 3x leverage, a 1.5% depeg causes ~4.5% equity loss
-- Strategy stays at 1x during extreme vol to avoid this
-- Emergency unwind triggers at 92% LTV or 10% drawdown
+| Signal detector | Yogi pattern | 4D anomaly scoring |
+| Regime engine | Yogi pattern | Vol × severity → allocation matrix |
+| Vol estimator | Kuma pattern | Parkinson on SOL candles |
+| Health monitor | Kuma pattern | LTV + drawdown (loop only) |
+| Pre-extreme wind-down | Arashi pattern | Early deleverage at 65% vol |
+| Kamino loop | @overlay/kamino-client | Deposit/borrow/repay (loop only) |
