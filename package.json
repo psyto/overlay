@@ -6,5 +6,8 @@
   "scripts": {
     "build": "tsc --build",
     "clean": "rm -rf packages/*/dist strategies/*/dist"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.30.1"
   }
 }
