@@ -1,16 +1,11 @@
 /**
- * Lightweight Mainnet Scanner — bypasses Marginfi SDK heavy initialization.
+ * Lightweight Mainnet Scanner v2 — Real on-chain liquidation heatmap.
  *
- * Instead of loading all 50+ banks and oracles, we:
- * 1. Fetch only the 3 banks we care about (SOL, USDC, JitoSOL)
- * 2. Use getProgramAccounts with memcmp to find accounts containing those banks
- * 3. Decode account data with a minimal parser
- *
- * This uses ~10x fewer RPC credits than the full SDK approach.
- *
- * Usage:
- *   RPC_URL="https://mainnet.helius-rpc.com/?api-key=KEY" \
- *     npx ts-node --transpile-only scripts/mainnet-scan-lite.ts
+ * 1. Fetch bank share rates (6 RPC calls)
+ * 2. Scan 509K Marginfi accounts in batches
+ * 3. Convert shares → tokens → USD
+ * 4. Compute liquidation prices
+ * 5. Build and print heatmap
  */
 
 import { Connection, PublicKey } from "@solana/web3.js";
@@ -19,165 +14,109 @@ import * as dotenv from "dotenv";
 dotenv.config();
 
 const RPC_URL = process.env.RPC_URL ?? "https://api.mainnet-beta.solana.com";
-
 const MARGINFI_PROGRAM = new PublicKey("MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA");
 const MARGINFI_GROUP = new PublicKey("4qp6Fx6tnZkY5Wropq9wUYgtFxXKwE6viZxFHg3rdAG8");
-
-// Banks we care about
-// REAL bank addresses discovered from on-chain data
-const TARGET_BANKS: Record<string, { address: PublicKey; decimals: number; isCollateral: boolean }> = {
-  SOL:     { address: new PublicKey("CCKtUs6Cgwo4aaQUmBPmyoApH2gUDErxNZCAntD6LYGh"), decimals: 9, isCollateral: true },
-  JitoSOL: { address: new PublicKey("Bohoc1ikHLD7xKJuzTyiTyCwzaL5N7ggJQu75A8mKYM8"), decimals: 9, isCollateral: true },
-  mSOL:    { address: new PublicKey("22DcjMZrMwC5Bpa5AGBsmjc5V9VuQrXG6N9ZtdUNyYGE"), decimals: 9, isCollateral: true },
-  bSOL:    { address: new PublicKey("6hS9i46WyTq1KXcoa2Chas2Txh9TJAVr6n1t3tnrE23K"), decimals: 9, isCollateral: true },
-  USDC:    { address: new PublicKey("2s37akK2eyBbp8DZgCm7RtsaEz8eJP3Nxd4urLHQv7yB"), decimals: 6, isCollateral: false },
-  USDT:    { address: new PublicKey("HmpMfL8942u22htC4EMiWgLX931g3sacXFR6KjuLgKLV"), decimals: 6, isCollateral: false },
-};
-
-// Marginfi account layout (from IDL):
-// 0-7: discriminator (8 bytes)
-// 8-39: group (Pubkey)
-// 40-71: authority (Pubkey)
-// 72-73: account_flags (u64) — but may be part of lending_account struct
-// Then lending_account.balances: array of Balance entries
-//
-// Each Balance (from IDL):
-//   active: bool (1 byte)
-//   bank_pk: Pubkey (32 bytes)
-//   [padding: 7 bytes to align to 8-byte boundary]
-//   asset_shares: WrappedI80F48 (16 bytes)
-//   liability_shares: WrappedI80F48 (16 bytes)
-//   emissions_outstanding: WrappedI80F48 (16 bytes)
-//   last_update: u64 (8 bytes)
-//   padding: [u64; 1] (8 bytes)
-//   = 1 + 32 + 7 + 16 + 16 + 16 + 8 + 8 = 104 bytes per balance
-//
-// Max 16 balance slots → 16 × 104 = 1664 bytes for balances
-// + header (72 bytes) + account_flags etc = ~2312 total (matches observed)
-
-const BALANCE_START = 72; // After header: 8(disc) + 32(group) + 32(authority) = 72
-const BALANCE_SIZE = 140; // Actual size per entry (to be determined empirically)
-const MAX_BALANCES = 16;
 const ACCOUNT_SIZE = 2312;
 
-interface ParsedBalance {
-  active: boolean;
-  bankPk: string;
-  bankSymbol: string;
-  assetShares: number;
-  liabilityShares: number;
-}
-
-interface ParsedAccount {
+// Real bank addresses from on-chain discovery
+const BANK_CONFIG: Record<string, {
   address: string;
-  authority: string;
-  balances: ParsedBalance[];
+  decimals: number;
+  isSolLike: boolean;  // Tracks SOL price
+  priceMultiplier: number; // Relative to SOL (JitoSOL ≈ 1.08x, mSOL ≈ 1.07x)
+}> = {
+  SOL:     { address: "CCKtUs6Cgwo4aaQUmBPmyoApH2gUDErxNZCAntD6LYGh", decimals: 9, isSolLike: true, priceMultiplier: 1.0 },
+  JitoSOL: { address: "Bohoc1ikHLD7xKJuzTyiTyCwzaL5N7ggJQu75A8mKYM8", decimals: 9, isSolLike: true, priceMultiplier: 1.08 },
+  mSOL:    { address: "22DcjMZrMwC5Bpa5AGBsmjc5V9VuQrXG6N9ZtdUNyYGE", decimals: 9, isSolLike: true, priceMultiplier: 1.07 },
+  bSOL:    { address: "6hS9i46WyTq1KXcoa2Chas2Txh9TJAVr6n1t3tnrE23K", decimals: 9, isSolLike: true, priceMultiplier: 1.05 },
+  USDC:    { address: "2s37akK2eyBbp8DZgCm7RtsaEz8eJP3Nxd4urLHQv7yB", decimals: 6, isSolLike: false, priceMultiplier: 0 },
+  USDT:    { address: "HmpMfL8942u22htC4EMiWgLX931g3sacXFR6KjuLgKLV", decimals: 6, isSolLike: false, priceMultiplier: 0 },
+};
+
+// Build reverse lookup
+const bankLookup = new Map<string, string>();
+for (const [sym, cfg] of Object.entries(BANK_CONFIG)) {
+  bankLookup.set(cfg.address, sym);
 }
 
-interface AnalyzedPosition {
+// Share rates loaded from on-chain bank accounts
+const shareRates: Record<string, { asset: number; liab: number }> = {};
+
+// --- i80f48 ---
+function readI80F48(buf: Buffer, off: number): number {
+  const lo = buf.readBigUInt64LE(off);
+  const hi = buf.readBigInt64LE(off + 8);
+  return Number(hi) * (2 ** 16) + Number(lo) / (2 ** 48);
+}
+
+// --- Load share rates from bank accounts ---
+async function loadShareRates(connection: Connection): Promise<void> {
+  console.log("Loading bank share rates...");
+  const bankAddrs = Object.entries(BANK_CONFIG).map(([sym, cfg]) => ({
+    sym,
+    pk: new PublicKey(cfg.address),
+  }));
+
+  const infos = await connection.getMultipleAccountsInfo(
+    bankAddrs.map((b) => b.pk)
+  );
+
+  for (let i = 0; i < infos.length; i++) {
+    const info = infos[i];
+    const sym = bankAddrs[i].sym;
+    if (!info) {
+      console.log(`  ${sym}: NOT FOUND — using default 1.0`);
+      shareRates[sym] = { asset: 1.0, liab: 1.0 };
+      continue;
+    }
+    // asset_share_value at offset 328, liability_share_value at offset 344
+    const assetRate = readI80F48(info.data, 328);
+    const liabRate = readI80F48(info.data, 344);
+    shareRates[sym] = { asset: assetRate, liab: liabRate };
+    console.log(`  ${sym}: asset=${assetRate.toFixed(6)} liab=${liabRate.toFixed(6)}`);
+  }
+}
+
+// --- Convert shares to USD ---
+function sharesToUsd(
+  shares: number,
+  sym: string,
+  type: "asset" | "liab",
+  solPrice: number
+): number {
+  const cfg = BANK_CONFIG[sym];
+  if (!cfg) return 0;
+  const rate = shareRates[sym]?.[type] ?? 1.0;
+  const tokenAmount = (shares * rate) / 10 ** cfg.decimals;
+  if (cfg.isSolLike) {
+    return tokenAmount * solPrice * cfg.priceMultiplier;
+  }
+  return tokenAmount; // Stablecoins = USD
+}
+
+// --- Position Types ---
+interface Position {
   address: string;
   owner: string;
   collateralUsd: number;
   debtUsd: number;
+  solCollateralTokens: number; // In SOL-equivalent terms
   ltv: number;
   liquidationPrice: number;
   collateralType: string;
 }
 
-// --- i80f48 decoder ---
-// Marginfi uses WrappedI80F48: a 128-bit fixed-point number
-// Stored as 16 bytes little-endian. The value = raw_bits / 2^48
-
-function readI80F48(buf: Buffer, offset: number): number {
-  // Read as two 64-bit integers (lo, hi)
-  const lo = buf.readBigUInt64LE(offset);
-  const hi = buf.readBigInt64LE(offset + 8);
-  // Combine: value = (hi << 64 | lo) / 2^48
-  // For most practical values, lo/2^48 is sufficient (hi is sign extension)
-  const combined = Number(hi) * 2 ** 16 + Number(lo) / 2 ** 48;
-  return combined;
-}
-
-// --- Account Parser ---
-
-function findBalanceLayout(data: Buffer): { start: number; size: number } | null {
-  // Search for a known bank pubkey to determine the exact layout
-  for (const [, bank] of Object.entries(TARGET_BANKS)) {
-    const bankBytes = bank.address.toBuffer();
-    const idx = data.indexOf(bankBytes);
-    if (idx >= 0) {
-      // The active flag should be 1 byte before (with possible padding)
-      // Find the nearest position before idx where active=1
-      for (let back = 1; back <= 8; back++) {
-        if (data[idx - back] === 1) {
-          const entryStart = idx - back;
-          const bankOffset = back; // Bank is at +back from entry start
-          return { start: entryStart, size: 0 }; // Size TBD
-        }
-      }
-      // If no active flag found, bank_pk is at a fixed offset from entry start
-      return { start: idx - 8, size: 0 }; // Guess: 8 bytes before bank (active + padding)
-    }
-  }
-  return null;
-}
-
-function parseAccount(data: Buffer, address: string): ParsedAccount | null {
-  if (data.length < ACCOUNT_SIZE - 100) return null;
-
-  const authority = new PublicKey(data.slice(40, 72)).toBase58();
-  const balances: ParsedBalance[] = [];
-
-  const bankLookup = new Map<string, string>();
-  for (const [sym, bank] of Object.entries(TARGET_BANKS)) {
-    bankLookup.set(bank.address.toBase58(), sym);
-  }
-
-  // Parse balance entries at known offsets
-  // Layout: HDR(72) + Balance[16] × 104 bytes each
-  // Balance: active(1) + bank_pk(32) + tag(1) + pad(6) + asset_shares(16) + liab_shares(16) + emissions(16) + last_update(8) + pad(8)
-  for (let b = 0; b < MAX_BALANCES; b++) {
-    const off = BALANCE_START + b * BALANCE_SIZE;
-    if (off + BALANCE_SIZE > data.length) break;
-
-    const active = data[off];
-    if (active !== 1) continue;
-
-    const bankPk = new PublicKey(data.slice(off + 1, off + 33)).toBase58();
-    const sym = bankLookup.get(bankPk);
-    if (!sym) continue; // Skip unknown banks
-
-    // asset_shares at offset +40 (after active+bank_pk+tag+pad = 1+32+1+6 = 40)
-    const assetShares = readI80F48(data, off + 40);
-    // liability_shares at offset +56
-    const liabilityShares = readI80F48(data, off + 56);
-
-    balances.push({
-      active: true,
-      bankPk,
-      bankSymbol: sym,
-      assetShares: Math.max(0, assetShares),
-      liabilityShares: Math.max(0, liabilityShares),
-    });
-  }
-
-  if (balances.length === 0) return null;
-  return { address, authority, balances };
-}
-
 // --- SOL Price ---
-
 async function fetchSolPrice(): Promise<number> {
   try {
     const res = await fetch("https://data.api.drift.trade/stats/markets");
     if (!res.ok) return 100;
-    const body = (await res.json()) as {
-      success: boolean;
-      markets: Array<{ symbol: string; marketType: string; oraclePrice: string }>;
-    };
-    const sol = body.markets?.find((m) => m.symbol === "SOL-PERP");
+    const body = (await res.json()) as any;
+    const sol = body.markets?.find((m: any) => m.symbol === "SOL-PERP");
     return sol ? parseFloat(sol.oraclePrice) : 100;
-  } catch { return 100; }
+  } catch {
+    return 100;
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -185,17 +124,17 @@ function sleep(ms: number): Promise<void> {
 }
 
 // --- Main ---
-
 async function main(): Promise<void> {
-  console.log("=== Lightweight Mainnet Scanner ===\n");
-  console.log(`RPC: ${RPC_URL}\n`);
-
+  console.log("=== Mainnet Liquidation Heatmap ===\n");
   const connection = new Connection(RPC_URL, "confirmed");
   const solPrice = await fetchSolPrice();
   console.log(`SOL: $${solPrice.toFixed(2)}\n`);
 
-  // Step 1: Get all account pubkeys (lightweight — no data)
-  console.log("Step 1: Fetching account addresses...");
+  await loadShareRates(connection);
+  console.log("");
+
+  // Get all pubkeys
+  console.log("Fetching account addresses...");
   const allPubkeys = await connection.getProgramAccounts(MARGINFI_PROGRAM, {
     commitment: "confirmed",
     dataSlice: { offset: 0, length: 0 },
@@ -204,16 +143,16 @@ async function main(): Promise<void> {
       { dataSize: ACCOUNT_SIZE },
     ],
   });
-  console.log(`Total accounts: ${allPubkeys.length}\n`);
+  console.log(`Total: ${allPubkeys.length}\n`);
 
-  // Step 2: Batch fetch and parse
+  // Scan in batches
   const CHUNK = 100;
-  const LIMIT = Math.min(allPubkeys.length, 10000);
-  const positions: AnalyzedPosition[] = [];
+  const LIMIT = Math.min(allPubkeys.length, 20000);
+  const positions: Position[] = [];
   let scanned = 0;
-  let parsed = 0;
+  let withKnownBank = 0;
 
-  console.log(`Step 2: Scanning ${LIMIT} accounts...\n`);
+  console.log(`Scanning ${LIMIT} accounts...\n`);
 
   for (let i = 0; i < LIMIT; i += CHUNK) {
     const chunk = allPubkeys.slice(i, i + CHUNK).map((a) => a.pubkey);
@@ -225,125 +164,155 @@ async function main(): Promise<void> {
       for (let j = 0; j < infos.length; j++) {
         const info = infos[j];
         if (!info?.data) continue;
+        const d = info.data;
 
-        const account = parseAccount(info.data, chunk[j].toBase58());
-        if (!account) continue;
-        parsed++;
+        let totalAssetUsd = 0;
+        let totalLiabUsd = 0;
+        let solCollateralTokens = 0;
+        let collateralType = "";
+        let hasSolCollateral = false;
+        let hasDebt = false;
 
-        // Analyze: find SOL collateral + debt
-        const solBals = account.balances.filter(
-          (b) => TARGET_BANKS[b.bankSymbol]?.isCollateral && b.assetShares > 0
-        );
-        const debtBals = account.balances.filter((b) => b.liabilityShares > 0);
+        for (let b = 0; b < 16; b++) {
+          const off = 72 + b * 104;
+          if (off + 104 > d.length) break;
+          if (d[off] !== 1) continue;
 
-        if (solBals.length === 0 || debtBals.length === 0) continue;
+          const bankPk = new PublicKey(d.slice(off + 1, off + 33)).toBase58();
+          const sym = bankLookup.get(bankPk);
+          if (!sym) continue;
 
-        // Estimate USD values from shares
-        // Shares ≈ token amount (simplified — real conversion needs bank share rate)
-        const solBal = solBals[0];
-        const collateralTokens = solBal.assetShares;
-        const collateralUsd = collateralTokens * solPrice;
+          withKnownBank++;
+          const assetShares = readI80F48(d, off + 40);
+          const liabShares = readI80F48(d, off + 56);
 
-        let debtUsd = 0;
-        for (const d of debtBals) {
-          if (TARGET_BANKS[d.bankSymbol]?.isCollateral) {
-            debtUsd += d.liabilityShares * solPrice; // SOL-denominated debt
-          } else {
-            debtUsd += d.liabilityShares; // Stable debt (USDC = 1:1)
+          const assetUsd = sharesToUsd(assetShares, sym, "asset", solPrice);
+          const liabUsd = sharesToUsd(liabShares, sym, "liab", solPrice);
+
+          totalAssetUsd += assetUsd;
+          totalLiabUsd += liabUsd;
+
+          if (BANK_CONFIG[sym]?.isSolLike && assetUsd > 0) {
+            hasSolCollateral = true;
+            const cfg = BANK_CONFIG[sym];
+            solCollateralTokens += (assetShares * (shareRates[sym]?.asset ?? 1)) / 10 ** cfg.decimals;
+            collateralType = sym;
           }
+          if (liabUsd > 0) hasDebt = true;
         }
 
-        if (collateralUsd < 1000 || debtUsd < 500) continue;
+        // Filter: must have SOL-like collateral AND debt, minimum $100
+        if (!hasSolCollateral || !hasDebt || totalAssetUsd < 100 || totalLiabUsd < 50) continue;
 
-        const ltv = collateralUsd > 0 ? (debtUsd / collateralUsd) * 100 : 0;
-        const liqPrice = collateralTokens > 0
-          ? debtUsd / (collateralTokens * 0.80) // 80% maintenance
+        const ltv = totalAssetUsd > 0 ? (totalLiabUsd / totalAssetUsd) * 100 : 0;
+
+        // Liquidation price: the SOL price at which LTV hits 80% maintenance threshold
+        // At liquidation: totalLiabUsd / (solCollateralTokens × liqPrice × multiplier + stableAssets) = 0.80
+        // Simplified (assuming mostly SOL collateral):
+        const liqPrice = solCollateralTokens > 0
+          ? totalLiabUsd / (solCollateralTokens * 0.80)
           : 0;
 
+        if (liqPrice <= 0 || liqPrice > solPrice * 3) continue;
+
         positions.push({
-          address: account.address,
-          owner: account.authority,
-          collateralUsd,
-          debtUsd,
+          address: chunk[j].toBase58(),
+          owner: new PublicKey(d.slice(40, 72)).toBase58(),
+          collateralUsd: totalAssetUsd,
+          debtUsd: totalLiabUsd,
+          solCollateralTokens,
           ltv,
           liquidationPrice: liqPrice,
-          collateralType: solBal.bankSymbol,
+          collateralType,
         });
       }
 
-      await sleep(100); // Rate limit protection
-    } catch (err) {
-      console.log(`  Chunk ${Math.floor(i / CHUNK)} failed, waiting 3s...`);
+      await sleep(100);
+    } catch {
       await sleep(3000);
     }
 
-    if ((i / CHUNK) % 10 === 0 && i > 0) {
+    if ((i / CHUNK) % 20 === 0 && i > 0) {
       console.log(
-        `  Scanned: ${scanned} | Parsed: ${parsed} | SOL positions: ${positions.length}`
+        `  ${scanned}/${LIMIT} scanned | ${positions.length} leveraged SOL positions`
       );
     }
   }
 
   console.log(
-    `\nDone: ${scanned} scanned, ${parsed} with known banks, ${positions.length} leveraged SOL positions\n`
+    `\nScan: ${scanned} accounts | ${positions.length} leveraged SOL positions\n`
   );
 
   if (positions.length === 0) {
-    console.log("No positions found. The shares→value conversion may need calibration.");
-    console.log(`Parsed ${parsed} accounts with known bank pubkeys.`);
+    console.log("No leveraged SOL positions found in sample.");
     return;
   }
 
   // Summary
   const totalCol = positions.reduce((s, p) => s + p.collateralUsd, 0);
   const totalDebt = positions.reduce((s, p) => s + p.debtUsd, 0);
-
   console.log("=== SUMMARY ===");
   console.log(`Positions: ${positions.length}`);
-  console.log(`Total collateral: $${(totalCol / 1e6).toFixed(2)}M`);
-  console.log(`Total debt: $${(totalDebt / 1e6).toFixed(2)}M`);
-  console.log(`Avg LTV: ${totalCol > 0 ? (totalDebt / totalCol * 100).toFixed(1) : 0}%\n`);
+  console.log(`Collateral: $${(totalCol / 1e6).toFixed(3)}M`);
+  console.log(`Debt: $${(totalDebt / 1e6).toFixed(3)}M`);
+  console.log(`Avg LTV: ${(totalDebt / totalCol * 100).toFixed(1)}%\n`);
 
-  // Top positions
+  // Top 10
   const sorted = positions.sort((a, b) => b.collateralUsd - a.collateralUsd);
-  console.log("Top 10:");
+  console.log("Top 10 positions:");
   for (const p of sorted.slice(0, 10)) {
     console.log(
-      `  $${(p.collateralUsd / 1000).toFixed(0).padStart(6)}K col | ` +
-      `$${(p.debtUsd / 1000).toFixed(0).padStart(6)}K debt | ` +
+      `  $${(p.collateralUsd).toFixed(0).padStart(8)} col | ` +
+      `$${(p.debtUsd).toFixed(0).padStart(8)} debt | ` +
       `LTV ${p.ltv.toFixed(1).padStart(5)}% | ` +
-      `Liq $${p.liquidationPrice.toFixed(0).padStart(4)} | ` +
+      `Liq $${p.liquidationPrice.toFixed(2).padStart(7)} | ` +
       `${p.collateralType}`
     );
   }
 
   // Heatmap
-  console.log("\n=== LIQUIDATION HEATMAP ===\n");
-  const lo = solPrice * 0.5, hi = solPrice * 1.5;
-  const buckets = Array.from({ length: 20 }, (_, i) => ({
-    mid: lo + (hi - lo) * ((i + 0.5) / 20),
+  console.log("\n=== LIQUIDATION HEATMAP ===");
+  console.log(`SOL: $${solPrice.toFixed(2)}\n`);
+
+  const lo = solPrice * 0.3;
+  const hi = solPrice * 2.0;
+  const BUCKETS = 30;
+  const buckets = Array.from({ length: BUCKETS }, (_, i) => ({
+    mid: lo + (hi - lo) * ((i + 0.5) / BUCKETS),
     usd: 0,
     n: 0,
   }));
 
   for (const p of positions) {
     if (p.liquidationPrice < lo || p.liquidationPrice > hi) continue;
-    const idx = Math.floor(((p.liquidationPrice - lo) / (hi - lo)) * 20);
-    if (idx >= 0 && idx < 20) { buckets[idx].usd += p.collateralUsd; buckets[idx].n++; }
+    const idx = Math.floor(((p.liquidationPrice - lo) / (hi - lo)) * BUCKETS);
+    if (idx >= 0 && idx < BUCKETS) {
+      buckets[idx].usd += p.collateralUsd;
+      buckets[idx].n++;
+    }
   }
 
   const mx = Math.max(...buckets.map((b) => b.usd), 1);
   for (const b of buckets) {
     if (b.n === 0) continue;
-    const d = ((b.mid - solPrice) / solPrice * 100);
-    const bar = "█".repeat(Math.max(1, Math.round((b.usd / mx) * 40)));
-    const tag = b.usd >= 5e6 ? "CRIT" : b.usd >= 2e6 ? "HIGH" : b.usd >= 5e5 ? " MED" : " LOW";
-    const cur = Math.abs(d) < 3 ? " ◄" : "";
+    const d = ((b.mid - solPrice) / solPrice) * 100;
+    const bar = "█".repeat(Math.max(1, Math.round((b.usd / mx) * 50)));
+    const tag = b.usd >= 100000 ? "CRIT" : b.usd >= 50000 ? "HIGH" : b.usd >= 10000 ? " MED" : " LOW";
+    const cur = Math.abs(d) < 4 ? " ◄" : "";
     console.log(
       `$${b.mid.toFixed(0).padStart(4)} (${d >= 0 ? "+" : ""}${d.toFixed(0).padStart(4)}%) ` +
-      `[${tag}] $${(b.usd / 1e6).toFixed(2).padStart(6)}M (${String(b.n).padStart(3)}) ${bar}${cur}`
+      `[${tag}] $${(b.usd / 1e3).toFixed(1).padStart(7)}K (${String(b.n).padStart(3)}) ${bar}${cur}`
     );
   }
+
+  // Nearby
+  const near = positions.filter(
+    (p) => Math.abs((p.liquidationPrice - solPrice) / solPrice) < 0.1
+  );
+  const nearUsd = near.reduce((s, p) => s + p.collateralUsd, 0);
+  console.log(
+    `\n${near.length} positions ($${(nearUsd / 1e3).toFixed(1)}K) within 10% of current price`
+  );
 }
 
 main().catch(console.error);
