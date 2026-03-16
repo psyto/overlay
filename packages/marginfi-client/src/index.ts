@@ -183,43 +183,117 @@ export class MarginfiClientWrapper {
   /**
    * Scan all marginfi accounts for the liquidation density strategy.
    *
-   * This is expensive — fetches all account addresses first, then batch-loads.
-   * For production, consider filtering by health or using an indexer.
+   * Strategy: fetch all pubkeys (lightweight GPA), then batch-hydrate in chunks.
+   * Filters for accounts with meaningful positions (>$minAssetsUsd).
+   *
+   * @param minAssetsUsd - Minimum total assets to include
+   * @param maxAccounts - Stop scanning after this many addresses checked
+   * @param maxPositions - Stop collecting after this many qualifying positions
    */
   async getAllPositions(
-    maxAccounts: number = 500
+    minAssetsUsd: number = 1000,
+    maxAccounts: number = 10000,
+    maxPositions: number = 500
   ): Promise<MarginfiPosition[]> {
     const client = this.getClient();
 
-    // Step 1: Get all account addresses (lightweight)
+    // Step 1: Get all account pubkeys (zero-length dataSlice — very fast)
+    console.log("  [marginfi] Fetching account addresses...");
     const allAddresses = await client.getAllMarginfiAccountAddresses();
-    console.log(`  [marginfi] Total accounts: ${allAddresses.length}`);
+    console.log(`  [marginfi] Total accounts on-chain: ${allAddresses.length}`);
 
-    // Step 2: Batch-fetch accounts (100 per call)
+    // Step 2: Batch-fetch and parse in chunks of 100
     const positions: MarginfiPosition[] = [];
     const chunkSize = 100;
-    const limit = Math.min(allAddresses.length, maxAccounts);
+    const scanLimit = Math.min(allAddresses.length, maxAccounts);
+    let scanned = 0;
+    let errors = 0;
 
-    for (let i = 0; i < limit; i += chunkSize) {
+    for (let i = 0; i < scanLimit; i += chunkSize) {
+      if (positions.length >= maxPositions) break;
+
       const chunk = allAddresses.slice(i, i + chunkSize);
 
       try {
         const accounts = await client.getMultipleMarginfiAccounts(chunk);
+        scanned += chunk.length;
 
         for (const acct of accounts) {
-          const pos = this.parseAccount(acct);
+          if (positions.length >= maxPositions) break;
 
-          // Only track accounts with meaningful positions
-          if (pos.totalAssetsUsd < 100) continue;
+          try {
+            const pos = this.parseAccount(acct);
 
-          positions.push(pos);
+            // Filter: must have meaningful assets AND liabilities (leveraged)
+            if (pos.totalAssetsUsd < minAssetsUsd) continue;
+            if (pos.totalLiabilitiesUsd < 100) continue; // Skip lending-only
+
+            positions.push(pos);
+          } catch {
+            // Skip individual unparseable accounts
+          }
         }
       } catch (err) {
-        console.error(`  [marginfi] Chunk fetch failed at ${i}:`, err);
+        errors++;
+        if (errors > 10) {
+          console.error(`  [marginfi] Too many errors (${errors}), stopping scan`);
+          break;
+        }
+      }
+
+      // Progress every 20 chunks
+      if ((i / chunkSize) % 20 === 0 && i > 0) {
+        console.log(
+          `  [marginfi] Scanned ${scanned}/${scanLimit} accounts, ` +
+          `${positions.length} qualifying positions`
+        );
       }
     }
 
+    console.log(
+      `  [marginfi] Scan complete: ${scanned} checked, ` +
+      `${positions.length} positions (${errors} errors)`
+    );
+
     return positions;
+  }
+
+  /**
+   * Compute liquidation prices for all positions in a batch.
+   * Returns positions enriched with per-bank liquidation prices.
+   */
+  async enrichWithLiquidationPrices(
+    positions: MarginfiPosition[]
+  ): Promise<Array<MarginfiPosition & { liquidationPrices: Record<string, number | null> }>> {
+    const client = this.getClient();
+    const enriched = [];
+
+    for (const pos of positions) {
+      const liqPrices: Record<string, number | null> = {};
+
+      for (const bal of pos.balances) {
+        if (bal.assetValueUsd > 0 || bal.liabilityValueUsd > 0) {
+          try {
+            // Fetch the account wrapper to access computeLiquidationPriceForBank
+            const bankPk = new PublicKey(bal.bankAddress);
+            const acctPk = new PublicKey(pos.address);
+
+            // Use the client to get the wrapper
+            const accounts = await client.getMultipleMarginfiAccounts([acctPk]);
+            if (accounts.length > 0) {
+              const price = accounts[0].computeLiquidationPriceForBank(bankPk);
+              liqPrices[bal.bankAddress] = price;
+            }
+          } catch {
+            liqPrices[bal.bankAddress] = null;
+          }
+        }
+      }
+
+      enriched.push({ ...pos, liquidationPrices: liqPrices });
+    }
+
+    return enriched;
   }
 
   /**

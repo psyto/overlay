@@ -9,6 +9,8 @@
   "dependencies": {
     "@solana/web3.js": "^1.98.0",
     "@drift-labs/sdk": "^2.120.0-beta.1",
+    "@mrgnlabs/marginfi-client-v2": "^6.4.0",
+    "@mrgnlabs/mrgn-common": "^1.6.0",
     "bn.js": "^5.2.1",
     "dotenv": "^16.4.5",
     "ts-node": "^10.9.2",

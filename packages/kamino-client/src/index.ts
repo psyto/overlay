@@ -235,91 +235,143 @@ export class KaminoClient {
   }
 
   /**
-   * Scan all obligations on the market.
-   * Used by liquidation-density strategy.
+   * Scan all obligations on the market using on-chain data.
+   * Uses batchGetAllObligationsForMarket for memory-efficient streaming.
    *
-   * NOTE: This is expensive — uses getProgramAccounts.
-   * For production, consider caching and incremental updates.
+   * @param tag - Obligation type: 0=Vanilla, 1=Multiply, 3=Leverage. Default: all leveraged (1+3).
+   * @param minBorrowUsd - Minimum borrow value to include (filters dust).
+   * @param maxPositions - Stop after collecting this many positions.
    */
-  async getAllPositions(): Promise<KaminoPosition[]> {
+  async getAllPositions(
+    minBorrowUsd: number = 1000,
+    maxPositions: number = 500
+  ): Promise<KaminoPosition[]> {
     const market = await this.loadMarket();
-    // Use the Kamino REST API for bulk scanning as it's more efficient
-    // than deserializing all on-chain accounts
-    const marketAddr = this.marketAddress.toString();
+    const positions: KaminoPosition[] = [];
 
-    try {
-      const res = await fetch(
-        `https://api.kamino.finance/v2/kamino-market/${marketAddr}/obligations?limit=500`
-      );
-      if (!res.ok) {
-        console.warn(`Kamino API returned ${res.status}, falling back to empty`);
-        return [];
+    // Scan both Multiply (tag=1) and Leverage (tag=3) positions
+    for (const tag of [1, 3]) {
+      if (positions.length >= maxPositions) break;
+
+      console.log(`  [kamino] Scanning tag=${tag} obligations...`);
+      let batchCount = 0;
+
+      try {
+        const generator = market.batchGetAllObligationsForMarket(tag);
+
+        for await (const batch of generator) {
+          batchCount++;
+
+          for (const obligation of batch) {
+            if (positions.length >= maxPositions) break;
+
+            // Parse obligation into our format
+            const parsed = this.parseObligation(obligation, market);
+            if (!parsed) continue;
+
+            // Filter by minimum borrow size
+            if (parsed.totalBorrowedUsd < minBorrowUsd) continue;
+
+            positions.push(parsed);
+          }
+
+          if (positions.length >= maxPositions) break;
+
+          // Progress log every 10 batches
+          if (batchCount % 10 === 0) {
+            console.log(
+              `  [kamino] Processed ${batchCount} batches, ${positions.length} positions so far`
+            );
+          }
+        }
+      } catch (err) {
+        console.error(`  [kamino] Error scanning tag=${tag}:`, err);
       }
 
-      const data = (await res.json()) as Array<{
-        owner: string;
-        deposits: Array<{
-          mint: string;
-          symbol: string;
-          amount: number;
-          valueUsd: number;
-        }>;
-        borrows: Array<{
-          mint: string;
-          symbol: string;
-          amount: number;
-          valueUsd: number;
-        }>;
-        stats: {
-          ltv: number;
-          borrowLimit: number;
-          borrowedValue: number;
-        };
-      }>;
+      console.log(
+        `  [kamino] Tag=${tag}: ${batchCount} batches, ${positions.length} total positions`
+      );
+    }
 
-      return data.map((obl) => {
-        const totalDepositedUsd = obl.deposits.reduce(
-          (s, d) => s + d.valueUsd,
-          0
-        );
-        const totalBorrowedUsd = obl.borrows.reduce(
-          (s, b) => s + b.valueUsd,
-          0
-        );
+    return positions;
+  }
 
-        return {
-          owner: obl.owner,
-          reserves: [
-            ...obl.deposits.map((d) => ({
-              mint: d.mint,
-              symbol: d.symbol,
-              depositedAmount: d.amount,
-              depositedValueUsd: d.valueUsd,
-              borrowedAmount: 0,
-              borrowedValueUsd: 0,
-            })),
-            ...obl.borrows.map((b) => ({
-              mint: b.mint,
-              symbol: b.symbol,
-              depositedAmount: 0,
-              depositedValueUsd: 0,
-              borrowedAmount: b.amount,
-              borrowedValueUsd: b.valueUsd,
-            })),
-          ],
-          totalDepositedUsd,
-          totalBorrowedUsd,
-          currentLtv: obl.stats.ltv * 100,
-          liquidationLtv: 90,
-          healthFactor:
-            totalBorrowedUsd > 0
-              ? obl.stats.borrowLimit / totalBorrowedUsd
-              : Infinity,
-        };
-      });
+  /**
+   * Parse a KaminoObligation into our normalized format.
+   */
+  private parseObligation(
+    obligation: any,
+    market: KaminoMarket
+  ): KaminoPosition | null {
+    try {
+      const deposits = obligation.getDeposits?.() ?? [];
+      const borrows = obligation.getBorrows?.() ?? [];
+
+      if (deposits.length === 0 && borrows.length === 0) return null;
+
+      const reserves: KaminoPosition["reserves"] = [];
+
+      for (const dep of deposits) {
+        const reserve = dep.reserveAddress
+          ? market.getReserveByAddress?.(dep.reserveAddress)
+          : null;
+        reserves.push({
+          mint: dep.mintAddress?.toString() ?? reserve?.getLiquidityMint?.()?.toString() ?? "unknown",
+          symbol: reserve?.symbol ?? "?",
+          depositedAmount: dep.amount?.toNumber?.() ?? dep.amount ?? 0,
+          depositedValueUsd: dep.marketValueRefreshed?.toNumber?.() ?? dep.marketValueRefreshed ?? 0,
+          borrowedAmount: 0,
+          borrowedValueUsd: 0,
+        });
+      }
+
+      for (const bor of borrows) {
+        const reserve = bor.reserveAddress
+          ? market.getReserveByAddress?.(bor.reserveAddress)
+          : null;
+        const mint = bor.mintAddress?.toString() ?? reserve?.getLiquidityMint?.()?.toString() ?? "unknown";
+        const existing = reserves.find((r) => r.mint === mint);
+        if (existing) {
+          existing.borrowedAmount = bor.amount?.toNumber?.() ?? bor.amount ?? 0;
+          existing.borrowedValueUsd = bor.marketValueRefreshed?.toNumber?.() ?? bor.marketValueRefreshed ?? 0;
+        } else {
+          reserves.push({
+            mint,
+            symbol: reserve?.symbol ?? "?",
+            depositedAmount: 0,
+            depositedValueUsd: 0,
+            borrowedAmount: bor.amount?.toNumber?.() ?? bor.amount ?? 0,
+            borrowedValueUsd: bor.marketValueRefreshed?.toNumber?.() ?? bor.marketValueRefreshed ?? 0,
+          });
+        }
+      }
+
+      const totalDepositedUsd = reserves.reduce((s, r) => s + r.depositedValueUsd, 0);
+      const totalBorrowedUsd = reserves.reduce((s, r) => s + r.borrowedValueUsd, 0);
+
+      // LTV and liquidation threshold from the obligation itself
+      const currentLtv = obligation.loanToValue?.()?.toNumber?.() ?? (
+        totalDepositedUsd > 0 ? totalBorrowedUsd / totalDepositedUsd : 0
+      );
+      const liquidationLtv = obligation.liquidationLtv?.()?.toNumber?.() ?? 0.9;
+
+      const borrowLimit = obligation.refreshedStats?.borrowLimit ?? obligation.stats?.borrowLimit ?? 0;
+      const healthFactor = totalBorrowedUsd > 0
+        ? (typeof borrowLimit === "number" ? borrowLimit : borrowLimit.toNumber?.() ?? 0) / totalBorrowedUsd
+        : Infinity;
+
+      return {
+        owner: obligation.state?.owner?.toString() ?? "unknown",
+        reserves,
+        totalDepositedUsd,
+        totalBorrowedUsd,
+        currentLtv: currentLtv * 100, // Convert to percentage
+        liquidationLtv: liquidationLtv * 100,
+        healthFactor,
+      };
     } catch (err) {
-      console.error("Failed to fetch Kamino obligations:", err);
-      return [];
+      // Skip unparseable obligations
+      return null;
     }
   }
 
