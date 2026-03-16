@@ -1,0 +1,16 @@
+{
+  "name": "@overlay/backtests",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Backtesting framework for overlay strategies",
+  "scripts": {
+    "regime-leverage": "ts-node src/regime-leverage-backtest.ts",
+    "jlp-gamma-hedge": "ts-node src/jlp-gamma-hedge-backtest.ts",
+    "liquidation-density": "ts-node src/liquidation-density-backtest.ts",
+    "all": "ts-node src/regime-leverage-backtest.ts && ts-node src/jlp-gamma-hedge-backtest.ts && ts-node src/liquidation-density-backtest.ts"
+  },
+  "dependencies": {
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.0"
+  }
+}

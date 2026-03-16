@@ -1,0 +1,19 @@
+{
+  "name": "@overlay/jlp-client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Jupiter JLP wrapper — deposit, withdraw, basket weight tracking, fee APY",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.98.0",
+    "bn.js": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.1.5"
+  }
+}

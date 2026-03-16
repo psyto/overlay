@@ -1,0 +1,20 @@
+{
+  "name": "@overlay/kamino-client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Kamino Lend SDK wrapper — loop management, health monitoring, position reading",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest"
+  },
+  "dependencies": {
+    "@kamino-finance/klend-sdk": "^7.3.0",
+    "@solana/kit": "^2.1.0",
+    "bn.js": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.1.5"
+  }
+}

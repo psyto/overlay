@@ -1,0 +1,10 @@
+{
+  "name": "overlay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "On-top DeFi strategies composed from Fabrknt primitives",
+  "scripts": {
+    "build": "tsc --build",
+    "clean": "rm -rf packages/*/dist strategies/*/dist"
+  }
+}

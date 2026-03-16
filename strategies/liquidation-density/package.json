@@ -1,0 +1,29 @@
+{
+  "name": "@overlay/liquidation-density",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Liquidation heatmap trading — map leveraged positions, provide liquidity at cascade levels",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "keeper": "ts-node --esm src/keeper/index.ts",
+    "keeper:dev": "ts-node --esm src/keeper/index.ts --devnet",
+    "test": "jest"
+  },
+  "dependencies": {
+    "@overlay/shared": "workspace:*",
+    "@overlay/kamino-client": "workspace:*",
+    "@overlay/marginfi-client": "workspace:*",
+    "@solana/kit": "^2.1.0",
+    "@mrgnlabs/mrgn-common": "^1.6.0",
+    "@solana/web3.js": "^1.98.0",
+    "@coral-xyz/anchor": "^0.30.1",
+    "@drift-labs/sdk": "^2.120.0-beta.1",
+    "bn.js": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.1.5",
+    "typescript": "^5.5.0",
+    "ts-node": "^10.9.2"
+  }
+}

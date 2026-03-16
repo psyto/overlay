@@ -1,0 +1,17 @@
+{
+  "name": "@overlay/marginfi-client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Marginfi wrapper — position scanning, rate monitoring, liquidation execution",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest"
+  },
+  "dependencies": {
+    "@mrgnlabs/marginfi-client-v2": "^6.4.0",
+    "@mrgnlabs/mrgn-common": "^1.6.0",
+    "@solana/web3.js": "^1.98.0"
+  }
+}
