@@ -94,7 +94,7 @@ async function main(): Promise<void> {
   if (hasPosition(driftClient)) {
     console.log("Cleaning: closing existing position...");
     await closeSolPosition(driftClient);
-    await sleep(5000);
+    await sleep(10000);
   }
 
   let passed = 0;
@@ -109,7 +109,7 @@ async function main(): Promise<void> {
   if (shouldHedge1) {
     const sig = await openSolShort(driftClient, TEST_SIZE_USD, solPrice);
     console.log(`  Opened short: ${sig.slice(0, 16)}...`);
-    await sleep(5000);
+    await sleep(10000);
   }
 
   const hasPos1 = hasPosition(driftClient);
@@ -124,7 +124,7 @@ async function main(): Promise<void> {
   if (!shouldHedge2 && hasPosition(driftClient)) {
     const sig = await closeSolPosition(driftClient);
     console.log(`  Closed position: ${sig?.slice(0, 16) ?? "none"}...`);
-    await sleep(5000);
+    await sleep(10000);
   }
 
   const hasPos2 = hasPosition(driftClient);
@@ -139,7 +139,7 @@ async function main(): Promise<void> {
   if (shouldHedge3 && !hasPosition(driftClient)) {
     const sig = await openSolShort(driftClient, TEST_SIZE_USD, solPrice);
     console.log(`  Opened short: ${sig.slice(0, 16)}...`);
-    await sleep(5000);
+    await sleep(10000);
   }
 
   const hasPos3 = hasPosition(driftClient);
@@ -154,7 +154,7 @@ async function main(): Promise<void> {
   if (!shouldHedge4 && hasPosition(driftClient)) {
     const sig = await closeSolPosition(driftClient);
     console.log(`  Closed position: ${sig?.slice(0, 16) ?? "none"}...`);
-    await sleep(5000);
+    await sleep(10000);
   }
 
   const hasPos4 = hasPosition(driftClient);

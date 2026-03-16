@@ -21,9 +21,9 @@ const DRIFT_PROGRAM = new PublicKey("dRiftyHA39MWEi3m9aunc5MzRF1JYuBsbn6VPcn33UH
 const DRIFT_DATA_API = "https://data.api.drift.trade";
 
 const MARKETS = [
-  { symbol: "SOL-PERP", index: 0, testSizeUsd: 30 },
-  { symbol: "BTC-PERP", index: 1, testSizeUsd: 30 },
-  { symbol: "ETH-PERP", index: 2, testSizeUsd: 30 },
+  { symbol: "SOL-PERP", index: 0, testSizeUsd: 50 },
+  { symbol: "BTC-PERP", index: 1, testSizeUsd: 100 },  // Min order ~0.001 BTC = ~$75
+  { symbol: "ETH-PERP", index: 2, testSizeUsd: 50 },
 ];
 
 function sleep(ms: number): Promise<void> {
