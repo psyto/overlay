@@ -376,7 +376,7 @@ async function main(): Promise<void> {
   // Init Drift
   initialize({ env: "devnet" });
   const wallet = new Wallet(keypair);
-  const accountLoader = new BulkAccountLoader(connection, "confirmed", 5000);
+  const accountLoader = new BulkAccountLoader(connection, "confirmed", 30000); // 30s poll to avoid rate limits
   driftClient = new DriftClient({
     connection,
     wallet,

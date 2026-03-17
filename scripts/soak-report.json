@@ -1,0 +1,43 @@
+{
+  "startTime": "2026-03-17T00:15:23.813Z",
+  "endTime": "2026-03-17T00:15:23.830Z",
+  "durationHours": 0.000004722222222222222,
+  "totalEvents": 4,
+  "signalChecks": 1,
+  "trendChanges": 0,
+  "hedgeOpens": 0,
+  "hedgeCloses": 0,
+  "emergencies": 0,
+  "errors": 0,
+  "trendHistory": [
+    {
+      "timestamp": "2026-03-17T00:15:23.814Z",
+      "trend": "bull"
+    }
+  ],
+  "events": [
+    {
+      "timestamp": "2026-03-17T00:15:23.813Z",
+      "type": "heartbeat",
+      "message": "Initial trend: bull"
+    },
+    {
+      "timestamp": "2026-03-17T00:15:23.821Z",
+      "type": "signal",
+      "message": "Signal: CLEAR",
+      "data": {
+        "severity": 0
+      }
+    },
+    {
+      "timestamp": "2026-03-17T00:15:23.830Z",
+      "type": "heartbeat",
+      "message": "Hedge: inactive (trend: bull)"
+    },
+    {
+      "timestamp": "2026-03-17T00:15:23.830Z",
+      "type": "heartbeat",
+      "message": "Checks: 1 | Trend: bull | Hedge: OFF | Positions: none | Changes: 0 | Opens: 0 | Closes: 0 | Emergencies: 0 | Errors: 0"
+    }
+  ]
+}
