@@ -54,16 +54,29 @@ Tracks combined delta/gamma/vega across JLP + Drift hedge positions:
 - **Gamma**: JLP is short gamma (loses on big moves) — tracked but not actively hedged (VolSwap adds cost without benefit in most conditions)
 - **Rebalance trigger**: net delta exceeds ±10% → emergency rebalance
 
-## Devnet Test Results
+## Test Results
 
-All 7 tests passing:
-1. Signal detection (mainnet data) — SOL/BTC/ETH prices, spreads, funding
-2. Trend detection — correctly identifies current regime
-3. Vol estimation — Parkinson on SOL candles
-4. Drift order placement — real short on devnet
-5. Position verification
-6. Portfolio Greeks computation
-7. Emergency close-all
+| Test | Status | Details |
+|------|--------|---------|
+| Integration (7 steps) | **PASS** | Signals, trend, vol, Drift order, positions, Greeks, close-all |
+| Multi-market | **PASS** | SOL, BTC, ETH shorts all execute on devnet (3/3) |
+| Hedge toggle | **PASS** | 4 trend transitions correctly toggle hedge (4/4) |
+| 48hr soak test | **PENDING** | Continuous operation with JSON reporting |
+| Mainnet dry run | **PENDING** | Log-only keeper, real JLP position |
+
+### Go-Live Sequence
+
+1. **Soak test** (48hr) — run `scripts/devnet-soak-test.ts` in screen/tmux
+2. **Deposit** $500-1000 USDC into JLP on Jupiter
+3. **Dry run** (2-3 days) — `scripts/mainnet-dry-run.ts` logs decisions without executing
+4. **Enable** real execution via the keeper
+
+### Notes on Devnet Testing
+
+- BTC-PERP minimum order: ~$75 (0.001 BTC). Orders below this fail with `InvalidOrderMinOrderSize`.
+- Devnet positions settle quickly — verify checks need 10s+ wait after order placement.
+- Public devnet RPC rate-limits at 5s polling. Use 30s `BulkAccountLoader` interval.
+- QuickNode free tier limits `getMultipleAccounts` to 5 per call — insufficient for Drift SDK.
 
 ## Composed From
 
@@ -94,3 +107,13 @@ Modeled in backtest v3:
 - Weekly rebalance cost: ~$2-5 per adjustment
 
 Total 3-year cost impact: +711% (with costs) vs +733% (without costs) — costs reduce returns by ~3%.
+
+## Scripts
+
+| Script | Purpose | Duration |
+|--------|---------|----------|
+| `devnet-jlp-hedge-test.ts` | 7-step integration test | ~2 min |
+| `devnet-multi-market-test.ts` | SOL, BTC, ETH order execution | ~2 min |
+| `devnet-hedge-toggle-test.ts` | 4 trend transitions (bear/bull/range/bull) | ~2 min |
+| `devnet-soak-test.ts` | Continuous operation + JSON report | 48 hours |
+| `mainnet-dry-run.ts` | Log-only keeper with real JLP | 2-3 days |

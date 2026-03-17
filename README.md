@@ -71,11 +71,15 @@ overlay/
 │       ├── data-fetcher.ts      Drift Data API (1000 daily candles)
 │       └── reporting.ts         Stats, comparison tables, CSV export
 └── scripts/
-    ├── devnet-setup.ts          Initialize Drift account on devnet
-    ├── devnet-fund.ts           Mint devnet USDC via TokenFaucet
-    ├── devnet-jlp-hedge-test.ts 7-step integration test (all passing)
-    ├── mainnet-scan-lite.ts     Lightweight real heatmap from Marginfi
-    └── mainnet-scan-test.ts     Full SDK-based scanner (needs paid RPC)
+    ├── devnet-setup.ts              Initialize Drift account on devnet
+    ├── devnet-fund.ts               Mint devnet USDC via TokenFaucet
+    ├── devnet-jlp-hedge-test.ts     7-step integration test (all passing)
+    ├── devnet-multi-market-test.ts  SOL, BTC, ETH shorts (3/3 passing)
+    ├── devnet-hedge-toggle-test.ts  4 trend transitions (4/4 passing)
+    ├── devnet-soak-test.ts          48hr continuous run with JSON report
+    ├── mainnet-dry-run.ts           Log-only keeper on mainnet (no orders)
+    ├── mainnet-scan-lite.ts         Real liquidation heatmap from Marginfi
+    └── mainnet-scan-test.ts         Full SDK-based scanner (needs paid RPC)
 ```
 
 ## Composability
@@ -165,8 +169,29 @@ solana airdrop 2 $(solana-keygen pubkey ~/devnet-keypair.json) --url devnet
 npx ts-node --transpile-only scripts/devnet-setup.ts
 npx ts-node --transpile-only scripts/devnet-fund.ts
 
-# 5. Run 7-step integration test
-npx ts-node --transpile-only scripts/devnet-jlp-hedge-test.ts
+# 5. Run tests (all passing)
+npx ts-node --transpile-only scripts/devnet-jlp-hedge-test.ts      # 7-step integration
+npx ts-node --transpile-only scripts/devnet-multi-market-test.ts    # SOL, BTC, ETH shorts
+npx ts-node --transpile-only scripts/devnet-hedge-toggle-test.ts    # 4 trend transitions
+
+# 6. 48-hour soak test (run in screen/tmux)
+screen -S soak
+npx ts-node --transpile-only scripts/devnet-soak-test.ts
+# Ctrl+A, D to detach — writes soak-report.json every 30 min
+```
+
+### Go-Live Sequence
+
+```bash
+# Step 1: Deposit $500-1000 USDC into JLP on https://jup.ag
+
+# Step 2: Mainnet dry run (log-only, no orders — run 2-3 days)
+RPC_URL="your-mainnet-rpc" WALLET_ADDRESS="your-pubkey" \
+  npx ts-node --transpile-only scripts/mainnet-dry-run.ts
+
+# Step 3: Enable real execution (after dry run validates)
+RPC_URL="your-mainnet-rpc" MANAGER_KEYPAIR_PATH="your-keypair" \
+  npx ts-node --transpile-only strategies/jlp-gamma-hedge/src/keeper/index.ts
 ```
 
 ### Mainnet Liquidation Heatmap
@@ -177,13 +202,26 @@ RPC_URL="https://mainnet.helius-rpc.com/?api-key=YOUR_KEY" \
   npx ts-node --transpile-only scripts/mainnet-scan-lite.ts
 ```
 
-### Mainnet Keeper
+## Test Status
 
-```bash
-# Edit .env with mainnet RPC and keypair
-# Start the JLP trend-aware delta hedge keeper
-npx ts-node --transpile-only strategies/jlp-gamma-hedge/src/keeper/index.ts
-```
+### JLP Delta Hedge (go-live candidate)
+
+| Test | Status | Details |
+|------|--------|---------|
+| Integration (7 steps) | **PASS** | Signal detection, trend, vol, Drift orders, Greeks, close-all |
+| Multi-market (SOL/BTC/ETH) | **PASS** | All 3 markets open and close on devnet |
+| Hedge toggle (4 transitions) | **PASS** | bear→ON, bull→OFF, range→ON, bull→OFF |
+| 48hr soak test | **PENDING** | Continuous operation, trend monitoring, JSON report |
+| Mainnet dry run | **PENDING** | Log-only with real JLP position, 2-3 days |
+| Mainnet execution | **NOT STARTED** | After soak + dry run pass |
+
+### Liquidation Density
+
+| Test | Status | Details |
+|------|--------|---------|
+| Mainnet position scan | **PASS** | 260 positions found in 20K account sample |
+| Real heatmap | **PASS** | Density zones identified with USD values |
+| Full 509K scan | **BLOCKED** | Needs paid RPC (Helius Dev $49/mo) |
 
 ## Execution Cost Model
 
